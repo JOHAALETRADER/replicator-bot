@@ -2,7 +2,7 @@ import os
 import logging
 from typing import Optional, List
 
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 import aiohttp
 import re
@@ -23,6 +23,7 @@ TARGET_LANG     = os.getenv("TARGET_LANG", "EN").upper()
 SOURCE_LANG     = os.getenv("SOURCE_LANG", "ES").upper()
 FORMALITY       = os.getenv("FORMALITY", "default")  # less | default | more
 FORCE_TRANSLATE = os.getenv("FORCE_TRANSLATE", "false").lower() == "true"
+TRANSLATE_BUTTONS = os.getenv("TRANSLATE_BUTTONS", "false").lower() == "true"  # <— NUEVO
 
 # GLOSARIO
 GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()
@@ -139,7 +140,7 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
                 "auth_key": DEEPL_API_KEY,
                 "text": text,
                 "target_lang": tgt,
-                "source_lang": src,          # <-- clave para glosarios
+                "source_lang": src,          # obligatorio si usas glosario
             }
             if tgt in FORMALITY_LANGS:
                 data["formality"] = FORMALITY
@@ -174,13 +175,39 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
 
     return text
 
+# --- NUEVO: traducir solo el texto de los botones, mantener contenido (URL/callback) ---
+async def translate_inline_keyboard(markup: Optional[InlineKeyboardMarkup], target_lang: str) -> Optional[InlineKeyboardMarkup]:
+    if not TRANSLATE_BUTTONS or not markup or not getattr(markup, "inline_keyboard", None):
+        return markup
+    new_rows: List[List[InlineKeyboardButton]] = []
+    for row in markup.inline_keyboard:
+        new_row: List[InlineKeyboardButton] = []
+        for b in row:
+            try:
+                new_text = await translate_text(b.text or "", target_lang)
+            except Exception:
+                new_text = b.text or ""
+            # reconstruir botón conservando destino/acción
+            new_row.append(
+                InlineKeyboardButton(
+                    text=(new_text or "")[:64],  # margen por si se pasa
+                    url=b.url,
+                    callback_data=b.callback_data,
+                    switch_inline_query=b.switch_inline_query,
+                    switch_inline_query_current_chat=b.switch_inline_query_current_chat,
+                    web_app=getattr(b, "web_app", None)
+                )
+            )
+        new_rows.append(new_row)
+    return InlineKeyboardMarkup(new_rows)
+
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.channel_post or not _chat_matches_source(update):
         return
 
     msg = update.channel_post
 
-    # Si no hay traducción, copia 1:1 (esto mantiene botones automáticamente)
+    # Si no hay traducción, copia 1:1 (mantiene botones automáticamente)
     if not TRANSLATE:
         await context.bot.copy_message(
             chat_id=DEST_CHANNEL,
@@ -194,27 +221,27 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if text_plain.strip():
         translated = await translate_text(text_plain, TARGET_LANG)
-        chunks = _split_chunks(translated)
+        translated_markup = await translate_inline_keyboard(msg.reply_markup, TARGET_LANG)
 
-        # ✅ Mantener botones: usar reply_markup del mensaje original
+        chunks = _split_chunks(translated)
         for i, chunk in enumerate(chunks):
             await context.bot.send_message(
                 chat_id=DEST_CHANNEL,
                 text=chunk,
                 parse_mode=None,
                 disable_web_page_preview=True,
-                reply_markup=msg.reply_markup if i == 0 else None  # botones solo en el primer trozo
+                reply_markup=translated_markup if i == 0 else None  # botones solo en el 1º
             )
     else:
         translated_caption = await translate_text(caption_plain or "", TARGET_LANG)
-        # ✅ Para media + caption, copiar el mensaje original con caption traducida y mismos botones
+        translated_markup = await translate_inline_keyboard(msg.reply_markup, TARGET_LANG)
         await context.bot.copy_message(
             chat_id=DEST_CHANNEL,
             from_chat_id=msg.chat.id,
             message_id=msg.message_id,
             caption=translated_caption if translated_caption else None,
             parse_mode=None if translated_caption else None,
-            reply_markup=msg.reply_markup  # mantener inline keyboard
+            reply_markup=translated_markup
         )
 
 def main():

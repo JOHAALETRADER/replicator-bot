@@ -12,32 +12,32 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL")
 DEST_CHANNEL = os.getenv("DEST_CHANNEL")
 
-TRANSLATE = os.getenv("TRANSLATE", "false").lower() == "true"
+TRANSLATE  = os.getenv("TRANSLATE", "false").lower() == "true"
 TRANSLATOR = os.getenv("TRANSLATOR", "none").lower()  # "deepl" | "libre" | "none"
 
-DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
+DEEPL_API_KEY  = os.getenv("DEEPL_API_KEY")
+DEEPL_API_HOST = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()  # api-free.deepl.com | api.deepl.com
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate")
 
 TARGET_LANG = os.getenv("TARGET_LANG", "EN").upper()
 FORMALITY   = os.getenv("FORMALITY", "less")  # less | default | more
-
-# Host DeepL según tu plan (muy importante)
-DEEPL_API_HOST = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()  # api-free.deepl.com | api.deepl.com
-# Forzar traducción (ignorar detección de “ya está en inglés”)
 FORCE_TRANSLATE = os.getenv("FORCE_TRANSLATE", "false").lower() == "true"
 
 # GLOSARIO: dos modos
 GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()   # si ya tienes un ID, úsalo
-GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()  # si NO hay ID, creamos uno con este TSV
+GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()  # si NO hay ID, crearemos uno con este TSV
+
+# DeepL solo soporta "formality" en estos idiomas:
+FORMALITY_LANGS = {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("replicator")
 
 def _ensure_env():
     missing = []
-    if not BOT_TOKEN:        missing.append("BOT_TOKEN")
-    if not SOURCE_CHANNEL:   missing.append("SOURCE_CHANNEL")
-    if not DEST_CHANNEL:     missing.append("DEST_CHANNEL")
+    if not BOT_TOKEN:      missing.append("BOT_TOKEN")
+    if not SOURCE_CHANNEL: missing.append("SOURCE_CHANNEL")
+    if not DEST_CHANNEL:   missing.append("DEST_CHANNEL")
     if missing:
         raise RuntimeError("Faltan variables: " + ", ".join(missing))
 
@@ -81,9 +81,14 @@ async def _deepl_create_glossary_if_needed() -> Optional[str]:
     form.add_field("name", "Trading ES-EN (Auto)")
     form.add_field("source_lang", "ES")
     form.add_field("target_lang", "EN")
-    form.add_field("entries", GLOSSARY_TSV, filename="glossary.tsv", content_type="text/tab-separated-values")
+    form.add_field("entries", GLOSSARY_TSV, filename="glossary.tsv",
+                   content_type="text/tab-separated-values")
 
-    headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
+    headers = {
+        "Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}",
+        # MUY IMPORTANTE: enviar el Content-Type del form con el boundary correcto
+        "Content-Type": form.content_type,
+    }
     timeout = aiohttp.ClientTimeout(total=30)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -106,7 +111,7 @@ async def _deepl_create_glossary_if_needed() -> Optional[str]:
 async def translate_text(text: Optional[str], target_lang: str = None) -> str:
     """
     Traduce TEXTO PLANO (no HTML).
-    - DeepL con formality y glosario (ID ya existente o creado automáticamente).
+    - DeepL con glosario (ID ya existente o creado automáticamente).
     - LibreTranslate como alternativa.
     - Evita traducir si ya parece inglés (a menos que FORCE_TRANSLATE=true).
     """
@@ -128,8 +133,11 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
                 "auth_key": DEEPL_API_KEY,
                 "text": text,
                 "target_lang": tgt,
-                "formality": FORMALITY,
             }
+            # solo enviar "formality" si el idioma destino lo soporta
+            if tgt in FORMALITY_LANGS:
+                data["formality"] = FORMALITY
+
             if GLOSSARY_ID:
                 data["glossary_id"] = GLOSSARY_ID
 
@@ -141,8 +149,7 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
                         logger.warning("DeepL translate HTTP %s: %s", resp.status, txt)
                         return text  # fallback: deja el original
                     js = await resp.json()
-                    out = js["translations"][0]["text"]
-                    return out
+                    return js["translations"][0]["text"]
 
         elif TRANSLATOR == "libre":
             url = LIBRETRANSLATE_URL
@@ -205,3 +212,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

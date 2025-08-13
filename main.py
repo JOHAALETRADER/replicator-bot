@@ -20,13 +20,13 @@ DEEPL_API_HOST  = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()  # a
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate").strip()
 
 TARGET_LANG     = os.getenv("TARGET_LANG", "EN").upper()
-SOURCE_LANG     = os.getenv("SOURCE_LANG", "ES").upper()   # <— NUEVO: idioma de origen
-FORMALITY       = os.getenv("FORMALITY", "default")        # less | default | more
+SOURCE_LANG     = os.getenv("SOURCE_LANG", "ES").upper()
+FORMALITY       = os.getenv("FORMALITY", "default")  # less | default | more
 FORCE_TRANSLATE = os.getenv("FORCE_TRANSLATE", "false").lower() == "true"
 
 # GLOSARIO
-GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()        # usar el ID ya creado
-GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()       # si NO hay ID, crear a partir de TSV (opcional)
+GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()
+GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()
 
 # DeepL solo soporta "formality" en estos idiomas:
 FORMALITY_LANGS = {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}
@@ -66,9 +66,7 @@ def _probably_english(text: str) -> bool:
     return (len(ascii_letters) / max(1, len(letters))) > 0.85
 
 async def _deepl_create_glossary_if_needed() -> Optional[str]:
-    """
-    Si no hay GLOSSARY_ID pero sí GLOSSARY_TSV, crea el glosario en DeepL y devuelve el ID.
-    """
+    """Si no hay GLOSSARY_ID pero sí GLOSSARY_TSV, crea el glosario en DeepL y devuelve el ID."""
     global GLOSSARY_ID
     if TRANSLATOR != "deepl" or not DEEPL_API_KEY:
         return None
@@ -96,7 +94,7 @@ async def _deepl_create_glossary_if_needed() -> Optional[str]:
                     logger.warning("DeepL glossary create HTTP %s: %s", resp.status, txt)
                     return None
                 js = await resp.json()
-                GLOSSARY_ID = js.get("glossary_id", "")  # guardar para esta ejecución
+                GLOSSARY_ID = js.get("glossary_id", "")
                 if GLOSSARY_ID:
                     logger.info("DeepL glossary created: %s", GLOSSARY_ID)
                 else:
@@ -134,15 +132,14 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
 
     try:
         if TRANSLATOR == "deepl" and DEEPL_API_KEY:
-            await _deepl_create_glossary_if_needed()  # no hace nada si ya hay ID
+            await _deepl_create_glossary_if_needed()
 
             url = f"https://{DEEPL_API_HOST}/v2/translate"
             data = {
                 "auth_key": DEEPL_API_KEY,
                 "text": text,
                 "target_lang": tgt,
-                # enviar source_lang siempre es seguro; con glosario es obligatorio
-                "source_lang": src,
+                "source_lang": src,          # <-- clave para glosarios
             }
             if tgt in FORMALITY_LANGS:
                 data["formality"] = FORMALITY
@@ -183,7 +180,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     msg = update.channel_post
 
-    # Si no hay traducción, copia 1:1
+    # Si no hay traducción, copia 1:1 (esto mantiene botones automáticamente)
     if not TRANSLATE:
         await context.bot.copy_message(
             chat_id=DEST_CHANNEL,
@@ -197,21 +194,27 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if text_plain.strip():
         translated = await translate_text(text_plain, TARGET_LANG)
-        for chunk in _split_chunks(translated):
+        chunks = _split_chunks(translated)
+
+        # ✅ Mantener botones: usar reply_markup del mensaje original
+        for i, chunk in enumerate(chunks):
             await context.bot.send_message(
                 chat_id=DEST_CHANNEL,
                 text=chunk,
                 parse_mode=None,
                 disable_web_page_preview=True,
+                reply_markup=msg.reply_markup if i == 0 else None  # botones solo en el primer trozo
             )
     else:
         translated_caption = await translate_text(caption_plain or "", TARGET_LANG)
+        # ✅ Para media + caption, copiar el mensaje original con caption traducida y mismos botones
         await context.bot.copy_message(
             chat_id=DEST_CHANNEL,
             from_chat_id=msg.chat.id,
             message_id=msg.message_id,
             caption=translated_caption if translated_caption else None,
             parse_mode=None if translated_caption else None,
+            reply_markup=msg.reply_markup  # mantener inline keyboard
         )
 
 def main():

@@ -20,12 +20,13 @@ DEEPL_API_HOST  = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()  # a
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate").strip()
 
 TARGET_LANG     = os.getenv("TARGET_LANG", "EN").upper()
-FORMALITY       = os.getenv("FORMALITY", "default")  # less | default | more
+SOURCE_LANG     = os.getenv("SOURCE_LANG", "ES").upper()   # <— NUEVO: idioma de origen
+FORMALITY       = os.getenv("FORMALITY", "default")        # less | default | more
 FORCE_TRANSLATE = os.getenv("FORCE_TRANSLATE", "false").lower() == "true"
 
 # GLOSARIO
-GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()   # usar el ID ya creado
-GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()  # si NO hay ID, crear a partir de TSV (opcional)
+GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()        # usar el ID ya creado
+GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()       # si NO hay ID, crear a partir de TSV (opcional)
 
 # DeepL solo soporta "formality" en estos idiomas:
 FORMALITY_LANGS = {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}
@@ -129,6 +130,7 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
         return text
 
     tgt = (target_lang or TARGET_LANG or "EN").upper()
+    src = SOURCE_LANG or "ES"
 
     try:
         if TRANSLATOR == "deepl" and DEEPL_API_KEY:
@@ -139,6 +141,8 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
                 "auth_key": DEEPL_API_KEY,
                 "text": text,
                 "target_lang": tgt,
+                # enviar source_lang siempre es seguro; con glosario es obligatorio
+                "source_lang": src,
             }
             if tgt in FORMALITY_LANGS:
                 data["formality"] = FORMALITY
@@ -193,7 +197,6 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if text_plain.strip():
         translated = await translate_text(text_plain, TARGET_LANG)
-        # dividir si excede el límite de Telegram
         for chunk in _split_chunks(translated):
             await context.bot.send_message(
                 chat_id=DEST_CHANNEL,

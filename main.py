@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Optional
+from typing import Optional, List
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -15,17 +15,17 @@ DEST_CHANNEL = os.getenv("DEST_CHANNEL")
 TRANSLATE  = os.getenv("TRANSLATE", "false").lower() == "true"
 TRANSLATOR = os.getenv("TRANSLATOR", "none").lower()  # "deepl" | "libre" | "none"
 
-DEEPL_API_KEY  = os.getenv("DEEPL_API_KEY")
-DEEPL_API_HOST = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()  # api-free.deepl.com | api.deepl.com
-LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate")
+DEEPL_API_KEY   = os.getenv("DEEPL_API_KEY")
+DEEPL_API_HOST  = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()  # api-free.deepl.com | api.deepl.com
+LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate").strip()
 
-TARGET_LANG = os.getenv("TARGET_LANG", "EN").upper()
-FORMALITY   = os.getenv("FORMALITY", "less")  # less | default | more
+TARGET_LANG     = os.getenv("TARGET_LANG", "EN").upper()
+FORMALITY       = os.getenv("FORMALITY", "default")  # less | default | more
 FORCE_TRANSLATE = os.getenv("FORCE_TRANSLATE", "false").lower() == "true"
 
-# GLOSARIO: dos modos
-GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()   # si ya tienes un ID, úsalo
-GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()  # si NO hay ID, crearemos uno con este TSV
+# GLOSARIO
+GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()   # usar el ID ya creado
+GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()  # si NO hay ID, crear a partir de TSV (opcional)
 
 # DeepL solo soporta "formality" en estos idiomas:
 FORMALITY_LANGS = {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}
@@ -44,8 +44,8 @@ def _ensure_env():
 def _chat_matches_source(update: Update) -> bool:
     chat = update.channel_post.chat
     if SOURCE_CHANNEL.startswith("@"):
-        uname = chat.username or ""
-        return ("@" + uname.lower()) == SOURCE_CHANNEL.lower()
+        uname = (chat.username or "").lower()
+        return ("@" + uname) == SOURCE_CHANNEL.lower()
     else:
         return str(chat.id) == SOURCE_CHANNEL
 
@@ -66,7 +66,7 @@ def _probably_english(text: str) -> bool:
 
 async def _deepl_create_glossary_if_needed() -> Optional[str]:
     """
-    Si no hay GLOSSARY_ID pero sí GLOSSARY_TSV, crea el glosario en DeepL (host correcto) y devuelve el ID.
+    Si no hay GLOSSARY_ID pero sí GLOSSARY_TSV, crea el glosario en DeepL y devuelve el ID.
     """
     global GLOSSARY_ID
     if TRANSLATOR != "deepl" or not DEEPL_API_KEY:
@@ -84,7 +84,6 @@ async def _deepl_create_glossary_if_needed() -> Optional[str]:
     form.add_field("entries", GLOSSARY_TSV, filename="glossary.tsv",
                    content_type="text/tab-separated-values")
 
-    # IMPORTANTE: NO fijes Content-Type manualmente; aiohttp lo pone con el boundary correcto.
     headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
 
     timeout = aiohttp.ClientTimeout(total=30)
@@ -96,7 +95,7 @@ async def _deepl_create_glossary_if_needed() -> Optional[str]:
                     logger.warning("DeepL glossary create HTTP %s: %s", resp.status, txt)
                     return None
                 js = await resp.json()
-                GLOSSARY_ID = js.get("glossary_id", "")
+                GLOSSARY_ID = js.get("glossary_id", "")  # guardar para esta ejecución
                 if GLOSSARY_ID:
                     logger.info("DeepL glossary created: %s", GLOSSARY_ID)
                 else:
@@ -106,10 +105,20 @@ async def _deepl_create_glossary_if_needed() -> Optional[str]:
         logger.warning("DeepL glossary create failed: %s", e)
         return None
 
+def _split_chunks(text: str, limit: int = 4096) -> List[str]:
+    """Divide textos largos para no exceder el límite de Telegram."""
+    if len(text) <= limit:
+        return [text]
+    parts: List[str] = []
+    while text:
+        parts.append(text[:limit])
+        text = text[limit:]
+    return parts
+
 async def translate_text(text: Optional[str], target_lang: str = None) -> str:
     """
     Traduce TEXTO PLANO (no HTML).
-    - DeepL con glosario (ID ya existente o creado automáticamente).
+    - DeepL con glosario si GLOSSARY_ID está definido (o lo crea si GLOSSARY_TSV está definido).
     - LibreTranslate como alternativa.
     - Evita traducir si ya parece inglés (a menos que FORCE_TRANSLATE=true).
     """
@@ -123,8 +132,7 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
 
     try:
         if TRANSLATOR == "deepl" and DEEPL_API_KEY:
-            # asegúrate de que hay glosario si el usuario nos dio TSV
-            await _deepl_create_glossary_if_needed()
+            await _deepl_create_glossary_if_needed()  # no hace nada si ya hay ID
 
             url = f"https://{DEEPL_API_HOST}/v2/translate"
             data = {
@@ -132,20 +140,18 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
                 "text": text,
                 "target_lang": tgt,
             }
-            # solo enviar "formality" si el idioma destino lo soporta (EN no lo soporta)
             if tgt in FORMALITY_LANGS:
                 data["formality"] = FORMALITY
-
             if GLOSSARY_ID:
                 data["glossary_id"] = GLOSSARY_ID
 
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, data=data) as resp:
-                    txt = await resp.text()
+                    body = await resp.text()
                     if resp.status != 200:
-                        logger.warning("DeepL translate HTTP %s: %s", resp.status, txt)
-                        return text  # fallback: deja el original
+                        logger.warning("DeepL translate HTTP %s: %s", resp.status, body)
+                        return text
                     js = await resp.json()
                     return js["translations"][0]["text"]
 
@@ -155,9 +161,9 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, data=data) as resp:
-                    txt = await resp.text()
+                    body = await resp.text()
                     if resp.status != 200:
-                        logger.warning("LibreTranslate HTTP %s: %s", resp.status, txt)
+                        logger.warning("LibreTranslate HTTP %s: %s", resp.status, body)
                         return text
                     js = await resp.json()
                     return js.get("translatedText", text)
@@ -173,6 +179,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     msg = update.channel_post
 
+    # Si no hay traducción, copia 1:1
     if not TRANSLATE:
         await context.bot.copy_message(
             chat_id=DEST_CHANNEL,
@@ -186,12 +193,14 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if text_plain.strip():
         translated = await translate_text(text_plain, TARGET_LANG)
-        await context.bot.send_message(
-            chat_id=DEST_CHANNEL,
-            text=translated,
-            parse_mode=None,
-            disable_web_page_preview=getattr(msg, "has_protected_content", False),
-        )
+        # dividir si excede el límite de Telegram
+        for chunk in _split_chunks(translated):
+            await context.bot.send_message(
+                chat_id=DEST_CHANNEL,
+                text=chunk,
+                parse_mode=None,
+                disable_web_page_preview=True,
+            )
     else:
         translated_caption = await translate_text(caption_plain or "", TARGET_LANG)
         await context.bot.copy_message(

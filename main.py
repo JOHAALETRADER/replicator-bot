@@ -4,7 +4,7 @@ from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, ChannelPostHandler, ContextTypes
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
 import aiohttp
 
 # -------- Config --------
@@ -96,7 +96,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def main():
     _ensure_env()
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(ChannelPostHandler(on_channel_post))
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     app.run_polling(allowed_updates=["channel_post"], poll_interval=1.5, stop_signals=None)
 
 if __name__ == "__main__":

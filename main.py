@@ -37,10 +37,15 @@ def _chat_matches_source(update: Update) -> bool:
         return str(chat.id) == SOURCE_CHANNEL
 
 async def translate_text(text: Optional[str], target_lang: str = "EN") -> str:
+    """
+    Traduce texto plano (no HTML). Usa DeepL si TRANSLATOR=deepl y hay DEEPL_API_KEY;
+    si no, intenta LibreTranslate (endpoint configurable por variable).
+    """
     if not text or not TRANSLATE:
         return text or ""
     try:
         if TRANSLATOR == "deepl" and DEEPL_API_KEY:
+            # DeepL: no necesita source_lang; target_lang "EN" para inglés
             url = "https://api-free.deepl.com/v2/translate"
             data = {"auth_key": DEEPL_API_KEY, "text": text, "target_lang": target_lang}
             timeout = aiohttp.ClientTimeout(total=30)
@@ -49,6 +54,7 @@ async def translate_text(text: Optional[str], target_lang: str = "EN") -> str:
                     js = await resp.json()
                     return js["translations"][0]["text"]
         elif TRANSLATOR == "libre":
+            # LibreTranslate público (puede estar lento/saturado). Acepta source/target
             url = LIBRETRANSLATE_URL
             data = {"q": text, "source": "es", "target": "en", "format": "text"}
             timeout = aiohttp.ClientTimeout(total=30)
@@ -65,6 +71,8 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     msg = update.channel_post
+
+    # Si no hay traducción, copia 1:1
     if not TRANSLATE:
         await context.bot.copy_message(
             chat_id=DEST_CHANNEL,
@@ -73,24 +81,27 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    text_html = msg.text_html
-    caption_html = msg.caption_html
-    if text_html:
-        translated = await translate_text(text_html, "EN")
+    # ---- CAMBIO CLAVE: usar TEXTO PLANO en lugar de *_html ----
+    text_plain = msg.text or ""
+    caption_plain = msg.caption or ""
+
+    if text_plain.strip():
+        translated = await translate_text(text_plain, "EN")
         await context.bot.send_message(
             chat_id=DEST_CHANNEL,
             text=translated,
-            parse_mode=ParseMode.HTML,
+            # No usamos HTML para evitar que caracteres de DeepL rompan el parseo
+            parse_mode=None,
             disable_web_page_preview=getattr(msg, "has_protected_content", False),
         )
     else:
-        translated_caption = await translate_text(caption_html or "", "EN")
+        translated_caption = await translate_text(caption_plain or "", "EN")
         await context.bot.copy_message(
             chat_id=DEST_CHANNEL,
             from_chat_id=msg.chat.id,
             message_id=msg.message_id,
             caption=translated_caption if translated_caption else None,
-            parse_mode=ParseMode.HTML if translated_caption else None,
+            parse_mode=None if translated_caption else None,
         )
 
 def main():

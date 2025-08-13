@@ -84,11 +84,9 @@ async def _deepl_create_glossary_if_needed() -> Optional[str]:
     form.add_field("entries", GLOSSARY_TSV, filename="glossary.tsv",
                    content_type="text/tab-separated-values")
 
-    headers = {
-        "Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}",
-        # MUY IMPORTANTE: enviar el Content-Type del form con el boundary correcto
-        "Content-Type": form.content_type,
-    }
+    # IMPORTANTE: NO fijes Content-Type manualmente; aiohttp lo pone con el boundary correcto.
+    headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
+
     timeout = aiohttp.ClientTimeout(total=30)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -134,7 +132,7 @@ async def translate_text(text: Optional[str], target_lang: str = None) -> str:
                 "text": text,
                 "target_lang": tgt,
             }
-            # solo enviar "formality" si el idioma destino lo soporta
+            # solo enviar "formality" si el idioma destino lo soporta (EN no lo soporta)
             if tgt in FORMALITY_LANGS:
                 data["formality"] = FORMALITY
 
@@ -212,4 +210,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

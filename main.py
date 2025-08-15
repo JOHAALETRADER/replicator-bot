@@ -94,7 +94,7 @@ G3 = -1002127373425
 TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
     # Grupo 1 → Grupo 4
     (G1, 129):   (G4, 8,   None),          # Resultados JT Traders → JT Wins
-    (G1, 1):     (G4, 10,  5958154558),    # Chat → Chat Room (solo tú)
+    (G1, 1):     (G4, 10,  5958164558),    # Chat → Chat Room (solo tú)
     (G1, 2890):  (G4, 6,   None),          # Resultados Alumnos → VIP Results & Payouts
     (G1, 17373): (G4, 6,   None),          # Retiros VIP → VIP Results & Payouts
     (G1, 8):     (G4, 2,   None),          # Estrategias/Archivos → Trading Plan & Risk

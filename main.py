@@ -11,10 +11,6 @@ from telegram import (
     InlineKeyboardButton,
     Message,
     MessageEntity,
-    InputMediaPhoto,
-    InputMediaVideo,
-    InputMediaDocument,
-    InputMediaAudio,
     Chat,
 )
 from telegram.constants import ChatType, ParseMode
@@ -53,9 +49,38 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s
 log = logging.getLogger("replicator")
 
 # ================== CANAL → CANAL ==================
-CHANNEL_MAP: Dict[str, str] = {
-    "@JohaaleTrader_es": "@JohaaleTrader_en",
+# Puedes dejar @username, pero con IDs -100... es más estable. También existen las variables ENV abajo.
+CHANNEL_MAP: Dict[Any, Any] = {
+    "@johaaletrader_es": "@johaaletrader_en",
 }
+
+# Lectura de ENV para canal→canal (toma prioridad si coinciden)
+ENV_SRC = (os.getenv("SOURCE_CHANNEL", "") or "").strip() or None
+ENV_DST = (os.getenv("DEST_CHANNEL", "") or "").strip() or None
+
+def _norm_chan(x: Any) -> tuple[Optional[str], Optional[int]]:
+    """
+    Normaliza un canal como (@username, id_num).
+    Retorna (username_con_@, id_num) cuando se pueda.
+    """
+    if x is None:
+        return (None, None)
+    if isinstance(x, int):
+        return (None, x)
+    s = str(x).strip()
+    if not s:
+        return (None, None)
+    if s.startswith("-100") and s[4:].isdigit():
+        try:
+            return (None, int(s))
+        except Exception:
+            return (None, None)
+    if s.startswith("@"):
+        return (s.lower(), None)
+    return ("@" + s.lower(), None)
+
+ENV_SRC_UNAME, ENV_SRC_ID = _norm_chan(ENV_SRC)
+ENV_DST_UNAME, ENV_DST_ID = _norm_chan(ENV_DST)
 
 # ================== GRUPOS / TEMAS ==================
 # Tus grupos
@@ -150,7 +175,6 @@ def build_html(fragments: List[Tuple[str, Dict[str, Any]]]) -> str:
     return "".join(out)
 
 # ================== GLOSARIO (DEFAULT) ==================
-# Si no defines GLOSSARY_ID ni GLOSSARY_TSV, creamos un glosario automático con estos términos.
 DEFAULT_GLOSSARY_TSV = """\
 JOHAALETRADER\tJOHAALETRADER
 JT TRADERS\tJT TRADERS
@@ -191,13 +215,9 @@ bearish\tbearish
 
 # ================== TRADUCCIÓN (DEEPL + GLOSARIO) ==================
 DEEPL_FORMALITY_LANGS = {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}
-
 _glossary_id_mem: Optional[str] = None  # cache en memoria para esta ejecución
 
 async def deepl_create_glossary_if_needed() -> Optional[str]:
-    """
-    Crea un glosario en DeepL si no hay GLOSSARY_ID. Usa GLOSSARY_TSV o DEFAULT_GLOSSARY_TSV.
-    """
     global _glossary_id_mem, GLOSSARY_ID
     if not TRANSLATE or not DEEPL_API_KEY:
         return None
@@ -245,9 +265,7 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         return text
 
     # asegurar glosario disponible (si procede)
-    gid = _glossary_id_mem or GLOSSARY_ID
-    if gid is None:
-        gid = ""
+    gid = _glossary_id_mem or GLOSSARY_ID or ""
     if not gid and (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV):
         try:
             gid = await deepl_create_glossary_if_needed() or ""
@@ -274,12 +292,59 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         js = await r.json()
         return js["translations"][0]["text"]
 
+def escape(t: str) -> str:
+    return html.escape(t, quote=False)
+
+def build_html(fragments: List[Tuple[str, Dict[str, Any]]]) -> str:
+    out: List[str] = []
+    for frag, meta in fragments:
+        safe = escape(frag)
+        tag = meta.get("tag")
+        if not tag:
+            out.append(safe); continue
+        if tag == "a":
+            href = html.escape(meta.get("href", ""), quote=True)
+            out.append(f'<a href="{href}">{safe}</a>')
+        elif tag in {"b","strong","i","em","u","s","del","code","pre","a"}:
+            out.append(f"<{tag}>{safe}</{tag}>")
+        else:
+            out.append(safe)
+    return "".join(out)
+
+def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str, Dict[str, Any]]]:
+    if not entities:
+        return [(text, {})]
+    entities = sorted(entities, key=lambda e: e.offset)
+    res: List[Tuple[str, Dict[str, Any]]] = []
+    idx = 0
+    for e in entities:
+        if e.offset > idx:
+            res.append((text[idx:e.offset], {}))
+        frag = text[e.offset:e.offset + e.length]
+        meta: Dict[str, Any] = {}
+        if e.type in ("bold",): meta["tag"] = "b"
+        elif e.type in ("italic",): meta["tag"] = "i"
+        elif e.type in ("underline",): meta["tag"] = "u"
+        elif e.type in ("strikethrough",): meta["tag"] = "s"
+        elif e.type in ("code",): meta["tag"] = "code"
+        elif e.type in ("pre",): meta["tag"] = "pre"
+        elif e.type == "text_link" and e.url:
+            meta["tag"] = "a"; meta["href"] = e.url
+        else:
+            meta = {}
+        res.append((frag, meta))
+        idx = e.offset + e.length
+    if idx < len(text):
+        res.append((text[idx:], {}))
+    return res
+
 async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
     frags = entities_to_html(text, entities or [])
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         new_frags: List[Tuple[str, Dict[str, Any]]] = []
         for frag, meta in frags:
+            # traducimos contenido visible; preservamos href/formatos
             if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
                 new_text = await deepl_translate(frag, session=session)
                 new_frags.append((new_text, meta))
@@ -313,16 +378,38 @@ async def translate_buttons(markup: Optional[InlineKeyboardMarkup]) -> Optional[
         return InlineKeyboardMarkup(rows)
 
 # ================== MAPEO ==================
-def map_channel(src_chat: Chat) -> Optional[str]:
-    uname = (src_chat.username or "").lower()
-    if not uname:
-        return None
-    return CHANNEL_MAP.get(f"@{uname}")
+def map_channel(src_chat: Chat) -> Optional[int | str]:
+    """
+    Devuelve el destino del canal origen. Prioridad:
+      1) Par de ENV (SOURCE_CHANNEL -> DEST_CHANNEL), por id o por @
+      2) CHANNEL_MAP (acepta claves por id, str(id) o @username en minúsculas)
+    """
+    src_id = int(src_chat.id)
+    src_uname = ("@" + (src_chat.username or "").lower()) if src_chat.username else None
+
+    # 1) ENV directo (por id o @)
+    if ENV_SRC_ID is not None and src_id == ENV_SRC_ID:
+        return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
+    if ENV_SRC_UNAME and src_uname and src_uname == ENV_SRC_UNAME:
+        return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
+
+    # 2) CHANNEL_MAP
+    if src_id in CHANNEL_MAP:                 # clave int
+        return CHANNEL_MAP[src_id]
+    if str(src_id) in CHANNEL_MAP:            # clave str del id
+        return CHANNEL_MAP[str(src_id)]
+    if src_uname and src_uname in CHANNEL_MAP:  # clave @username
+        return CHANNEL_MAP[src_uname]
+
+    return None
 
 def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optional[int]) -> Optional[Tuple[int,int]]:
-    if not src_thread_id:
-        return None
-    route = TOPIC_ROUTES.get((src_chat_id, src_thread_id))
+    """
+    Mapea (chat, thread) → (chat, thread), respetando filtro de remitente si lo hay.
+    Si thread_id viene None (pasa en Chat/General), lo tratamos como 1.
+    """
+    tid = src_thread_id if src_thread_id is not None else 1
+    route = TOPIC_ROUTES.get((src_chat_id, tid))
     if not route:
         return None
     dst_chat, dst_thread, only_sender = route
@@ -363,7 +450,7 @@ async def copy_with_translated_caption(context: ContextTypes.DEFAULT_TYPE, chat_
             message_id=msg.message_id,
             caption=cap_html,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb,
+            reply_markup=kb,  # si el API lo permite; si no, simplemente omítelo
         )
     else:
         await context.bot.copy_message(
@@ -388,7 +475,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dst = map_channel(msg.chat)
         if not dst:
             return
-        log.info("Channel %s → %s | msg %s", msg.chat.username, dst, msg.message_id)
+        log.info("Channel %s (id=%s) → %s | msg %s", msg.chat.username, msg.chat.id, dst, msg.message_id)
         await replicate_message(context, msg, dst, None)
     except Exception as e:
         log.exception("Error on_channel_post")
@@ -408,7 +495,7 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not route:
             return
         dst_chat, dst_thread = route
-        log.info("Group %s#%s → %s#%s | msg %s", chat.id, thread_id, dst_chat, dst_thread, msg.message_id)
+        log.info("Group %s#%s → %s#%s | msg %s", chat.id, thread_id if thread_id is not None else 1, dst_chat, dst_thread, msg.message_id)
         await replicate_message(context, msg, dst_chat, dst_thread)
     except Exception as e:
         log.exception("Error on_group_post")
@@ -424,7 +511,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_post))
-    log.info("Replicator iniciado. Translate=%s, Buttons=%s", TRANSLATE, TRANSLATE_BUTTONS)
+    log.info("Replicator iniciado. Translate=%s, Buttons=%s | ENV_SRC=%s ENV_DST=%s", TRANSLATE, TRANSLATE_BUTTONS, ENV_SRC, ENV_DST)
     app.run_polling(allowed_updates=["channel_post", "message"], poll_interval=1.2, stop_signals=None)
 
 if __name__ == "__main__":

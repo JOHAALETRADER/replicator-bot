@@ -160,11 +160,17 @@ async def translate_keyboard(markup: Optional[InlineKeyboardMarkup], tgt: str) -
     return InlineKeyboardMarkup(rows)
 
 def map_topic(chat_id: int, source_thread_id: Optional[int]) -> Optional[int]:
+    # Normalizamos: en algunos clientes el tema "General" llega como None o 0
+    norm_src = source_thread_id
+    if source_thread_id in (None, 0):
+        norm_src = 1  # asumimos que el General es 1 si existe en el mapping
+
     m1 = TOPIC_MAPPING.get(str(chat_id)) or {}
-    if not source_thread_id:
+    if not norm_src:
         return None
-    dst = m1.get(str(source_thread_id))
+    dst = m1.get(str(norm_src)) or m1.get(str(source_thread_id or ""))  # doble intento
     return int(dst) if dst else None
+
 
 async def alert_admin(context: ContextTypes.DEFAULT_TYPE, text: str):
     if ERROR_ALERT and ADMIN_ID:

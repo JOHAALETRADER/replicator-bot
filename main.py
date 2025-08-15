@@ -1,140 +1,66 @@
-import os
-import re
-import html
-import json
-import logging
-from typing import Optional, List, Tuple, Dict
+import os, re, json, logging, aiohttp, traceback
+from typing import Optional, List, Dict
 
 from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    Update, InlineKeyboardMarkup, InlineKeyboardButton,
+    Message, Chat, MessageEntity
 )
 from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, MessageHandler, ContextTypes, filters
 )
-import aiohttp
 
-# ========= Config por ENV =========
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ================== CONFIG (ENV) ==================
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
 
-# Canal -> Canal (tu flujo existente)
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL")  # ej: -100123..., o @mi_canal
-DEST_CHANNEL   = os.getenv("DEST_CHANNEL")    # ej: -100456..., o @destino
+# Canal a canal (ya lo tenías)
+SOURCE_CHANNEL   = os.getenv("SOURCE_CHANNEL", "").strip()
+DEST_CHANNEL     = os.getenv("DEST_CHANNEL", "").strip()
 
 # Traducción
-TRANSLATE  = os.getenv("TRANSLATE", "true").lower() == "true"
-TRANSLATOR = os.getenv("TRANSLATOR", "deepl").lower()  # deepl | libre | none
-DEEPL_API_KEY  = os.getenv("DEEPL_API_KEY", "").strip()
-DEEPL_API_HOST = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()
+TRANSLATE        = os.getenv("TRANSLATE", "false").lower() == "true"
+TRANSLATOR       = os.getenv("TRANSLATOR", "none").lower()       # "deepl" | "libre" | "none"
+DEEPL_API_KEY    = os.getenv("DEEPL_API_KEY", "").strip()
+DEEPL_API_HOST   = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate").strip()
+TARGET_LANG      = os.getenv("TARGET_LANG", "EN").upper()
+SOURCE_LANG      = os.getenv("SOURCE_LANG", "ES").upper()
+FORMALITY        = os.getenv("FORMALITY", "default")
+FORCE_TRANSLATE  = os.getenv("FORCE_TRANSLATE", "false").lower() == "true"
+TRANSLATE_BUTTONS= os.getenv("TRANSLATE_BUTTONS", "true").lower() == "true"  # traduce SOLO el texto de botones
 
-SOURCE_LANG = os.getenv("SOURCE_LANG", "ES").upper()
-TARGET_LANG = os.getenv("TARGET_LANG", "EN").upper()
-FORMALITY   = os.getenv("FORMALITY", "default")  # less | default | more
-FORCE_TRANSLATE = os.getenv("FORCE_TRANSLATE", "false").lower() == "true"
-TRANSLATE_BUTTONS = os.getenv("TRANSLATE_BUTTONS", "true").lower() == "true"
+# Glosario DeepL
+GLOSSARY_ID      = os.getenv("GLOSSARY_ID", "").strip()
+GLOSSARY_TSV     = os.getenv("GLOSSARY_TSV", "").strip()
 
-# Glosario DeepL (opcional)
-GLOSSARY_ID  = os.getenv("GLOSSARY_ID", "").strip()
-GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()
+# Mapeo de temas: JSON en env TOPIC_MAPPING
+# Ejemplo (UNA SOLA LÍNEA aceptada): {"-1001946870620":{"1":"20605","129":"20607",...},"-100213...":{...}}
+TOPIC_MAPPING_RAW = os.getenv("TOPIC_MAPPING", "{}")
+try:
+    TOPIC_MAPPING: Dict[str, Dict[str,str]] = json.loads(TOPIC_MAPPING_RAW) if TOPIC_MAPPING_RAW else {}
+except Exception:
+    TOPIC_MAPPING = {}
 
-# Admin para errores
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or "0")
+# Alertas de error
+ADMIN_ID   = os.getenv("ADMIN_ID", "").strip()        # tu user id (e.g., 5958154558)
+ERROR_ALERT= os.getenv("ERROR_ALERT", "true").lower() == "true"
 
-# ========= Constantes =========
-FORMALITY_LANGS = {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}
-
+# ================== LOG ===========================
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    level=logging.INFO
 )
-logger = logging.getLogger("replicator")
+log = logging.getLogger("replicator")
 
-# ========= Mapeo de Temas (según tu listado) =========
-# Nota: t.me/c/<abs_id>/<topic>/<msg>. El chat_id real = -100<abs_id>
-def _abs_to_chat(abs_id: int) -> int:
-    return -100 * 10**(len(str(abs_id))) - abs_id  # no sirve, mejor formemos directo
-# Atajo: ya te los dejo como enteros listos.
-
-ROUTES: List[Dict] = [
-    # ------- GRUPO 1 -------
-    # chat_id = -1001946870620
-    # CHAT (1) -> CHAT ROOM (20605), solo si es tu user
-    {"chat_id": -1001946870620, "src_topic": 1, "dst_topic": 20605, "only_from_user": 5958154558},
-
-    # RESULTADOS JT TRADERS (129) -> JT Wins (20607)
-    {"chat_id": -1001946870620, "src_topic": 129, "dst_topic": 20607},
-    # RESULTADOS ALUMNOS (2890) -> VIP Results & Payouts (20611)
-    {"chat_id": -1001946870620, "src_topic": 2890, "dst_topic": 20611},
-    # RETIROS VIP (17373) -> VIP Results & Payouts (20611)
-    {"chat_id": -1001946870620, "src_topic": 17373, "dst_topic": 20611},
-
-    # ESTRATEGIAS ARCHIVOS (8) -> Trading Plan & Risk (20613)
-    {"chat_id": -1001946870620, "src_topic": 8, "dst_topic": 20613},
-    # PLAN Y GESTIÓN DE RIESGO (11) -> Trading Plan & Risk (20613)
-    {"chat_id": -1001946870620, "src_topic": 11, "dst_topic": 20613},
-
-    # NOTICIAS Y SORTEOS (9) -> Updates & Prizes (20616)
-    {"chat_id": -1001946870620, "src_topic": 9, "dst_topic": 20616},
-
-    # ------- GRUPO 2 -------
-    # chat_id = -1002127373425
-    # RESULTADOS JT TRADERS TEAMS (3) -> JT Wins (4096)
-    {"chat_id": -1002127373425, "src_topic": 3, "dst_topic": 4096},
-    # RESULTADOS ALUMNOS VIP (2) -> VIP Results & Risk (4098)
-    {"chat_id": -1002127373425, "src_topic": 2, "dst_topic": 4098},
-
-    # ------- GRUPO 3 -------
-    # chat_id = -1002131156976
-    # BINARY SIGNALS (3) -> Binary Trade Signals (5571)
-    {"chat_id": -1002131156976, "src_topic": 3, "dst_topic": 5571},
-    # Binance Master Signals (5337) -> Binance Pro Signals (5573)
-    {"chat_id": -1002131156976, "src_topic": 5337, "dst_topic": 5573},
-    # Forex Bias (4) -> Market Insights & Analysis (5576)
-    {"chat_id": -1002131156976, "src_topic": 4, "dst_topic": 5576},
-    # Noticias y Análisis (272) -> Market Insights & Analysis (5576)
-    {"chat_id": -1002131156976, "src_topic": 272, "dst_topic": 5576},
-    # INDICES SYNTHETICOS (2) -> Synthetic Index Signals (5579)
-    {"chat_id": -1002131156976, "src_topic": 2, "dst_topic": 5579},
-]
-
-# Index rápido
-TOPIC_MAP: Dict[Tuple[int,int], Dict] = {
-    (r["chat_id"], r["src_topic"]): r for r in ROUTES
-}
-
-# ========= Utilidades =========
-def _ensure_env():
-    missing = []
-    if not BOT_TOKEN:      missing.append("BOT_TOKEN")
-    if not SOURCE_CHANNEL: missing.append("SOURCE_CHANNEL")
-    if not DEST_CHANNEL:   missing.append("DEST_CHANNEL")
+# ================== HELPERS =======================
+def need_vars(*pairs):
+    missing = [name for name, val in pairs if not val]
     if missing:
         raise RuntimeError("Faltan variables: " + ", ".join(missing))
 
-def _id_from_channel(chat) -> str:
-    """Devuelve '@user' o el ID numérico como string, para comparar con envs."""
-    if isinstance(chat.id, int):
-        return str(chat.id)
-    return str(chat.username or "")
-
-def _chat_matches_source(update: Update) -> bool:
-    chat = update.channel_post.chat
-    if str(SOURCE_CHANNEL).startswith("@"):
-        uname = (chat.username or "").lower()
-        return ("@" + uname) == SOURCE_CHANNEL.lower()
-    else:
-        return str(chat.id) == str(SOURCE_CHANNEL)
-
-# Heurística: evitar retraducir si ya es inglés
 _EN_COMMON = re.compile(r"\b(the|and|for|with|from|to|of|in|on|is|are|you|we|they|buy|sell|trade|signal|profit|setup)\b", re.I)
 _ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|con|sin|desde|hoy|mañana|ayer|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
 
-def _probably_english(text: str) -> bool:
+def probably_english(text: str) -> bool:
     if _ES_MARKERS.search(text): return False
     if _EN_COMMON.search(text):  return True
     letters = [c for c in text if c.isalpha()]
@@ -142,149 +68,82 @@ def _probably_english(text: str) -> bool:
     ascii_letters = [c for c in letters if ord(c) < 128]
     return (len(ascii_letters) / max(1, len(letters))) > 0.85
 
-def _split_chunks(text: str, limit: int = 4096) -> List[str]:
-    if len(text) <= limit: return [text]
-    parts: List[str] = []
-    while text:
-        parts.append(text[:limit])
-        text = text[limit:]
-    return parts
-
-async def _deepl_create_glossary_if_needed() -> Optional[str]:
+async def deepl_create_glossary_if_needed():
     global GLOSSARY_ID
-    if TRANSLATOR != "deepl" or not DEEPL_API_KEY: return None
-    if GLOSSARY_ID: return GLOSSARY_ID
-    if not GLOSSARY_TSV: return None
-
+    if TRANSLATOR != "deepl" or not DEEPL_API_KEY or GLOSSARY_ID or not GLOSSARY_TSV:
+        return
     url = f"https://{DEEPL_API_HOST}/v2/glossaries"
     form = aiohttp.FormData()
     form.add_field("name", "Trading ES-EN (Auto)")
     form.add_field("source_lang", "ES")
     form.add_field("target_lang", "EN")
-    form.add_field("entries", GLOSSARY_TSV, filename="glossary.tsv", content_type="text/tab-separated-values")
+    form.add_field("entries", GLOSSARY_TSV, filename="glossary.tsv",
+                   content_type="text/tab-separated-values")
     headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
-    timeout = aiohttp.ClientTimeout(total=30)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, data=form) as resp:
-                txt = await resp.text()
-                if resp.status != 200:
-                    logger.warning("DeepL glossary create HTTP %s: %s", resp.status, txt)
-                    return None
-                js = await resp.json()
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+            async with s.post(url, headers=headers, data=form) as r:
+                t = await r.text()
+                if r.status != 200:
+                    log.warning("DeepL glossary create HTTP %s: %s", r.status, t); return
+                js = await r.json()
                 GLOSSARY_ID = js.get("glossary_id", "")
                 if GLOSSARY_ID:
-                    logger.info("DeepL glossary created: %s", GLOSSARY_ID)
-                else:
-                    logger.warning("DeepL glossary creation response without ID: %s", txt)
-                return GLOSSARY_ID or None
+                    log.info("DeepL glossary created: %s", GLOSSARY_ID)
     except Exception as e:
-        logger.warning("DeepL glossary create failed: %s", e)
-        return None
+        log.warning("DeepL glossary create failed: %s", e)
 
-async def translate_text(text: Optional[str], target_lang: str = None) -> str:
-    if not text or not TRANSLATE:
-        return text or ""
-    if (not FORCE_TRANSLATE) and _probably_english(text):
+async def translate_text(text: Optional[str], target_lang: Optional[str] = None) -> str:
+    if not text: return ""
+    if not TRANSLATE: return text
+    if (not FORCE_TRANSLATE) and probably_english(text):
         return text
-
     tgt = (target_lang or TARGET_LANG or "EN").upper()
     src = SOURCE_LANG or "ES"
 
     try:
         if TRANSLATOR == "deepl" and DEEPL_API_KEY:
-            await _deepl_create_glossary_if_needed()
+            await deepl_create_glossary_if_needed()
             url = f"https://{DEEPL_API_HOST}/v2/translate"
             data = {"auth_key": DEEPL_API_KEY, "text": text, "target_lang": tgt, "source_lang": src}
-            if tgt in FORMALITY_LANGS:
+            if tgt in {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}:
                 data["formality"] = FORMALITY
             if GLOSSARY_ID:
                 data["glossary_id"] = GLOSSARY_ID
-
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, data=data) as resp:
-                    body = await resp.text()
-                    if resp.status != 200:
-                        logger.warning("DeepL translate HTTP %s: %s", resp.status, body)
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+                async with s.post(url, data=data) as r:
+                    body = await r.text()
+                    if r.status != 200:
+                        log.warning("DeepL translate HTTP %s: %s", r.status, body)
                         return text
-                    js = await resp.json()
+                    js = await r.json()
                     return js["translations"][0]["text"]
 
-        elif TRANSLATOR == "libre":
-            url = LIBRETRANSLATE_URL
+        elif TRANSLATOR == "libre" and LIBRETRANSLATE_URL:
             data = {"q": text, "source": "auto", "target": tgt.lower().split("-")[0], "format": "text"}
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, data=data) as resp:
-                    body = await resp.text()
-                    if resp.status != 200:
-                        logger.warning("LibreTranslate HTTP %s: %s", resp.status, body)
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+                async with s.post(LIBRETRANSLATE_URL, data=data) as r:
+                    body = await r.text()
+                    if r.status != 200:
+                        log.warning("LibreTranslate HTTP %s: %s", r.status, body)
                         return text
-                    js = await resp.json()
+                    js = await r.json()
                     return js.get("translatedText", text)
 
     except Exception as e:
-        logger.warning("Fallo al traducir: %s", e)
+        log.warning("Fallo al traducir: %s", e)
 
     return text
 
-# ============ Enlaces bonitos (TEXT_LINK) ============
-def _mask_text_links(original_text: str, entities) -> Tuple[str, List[Tuple[str, str]]]:
-    """
-    Reemplaza cada TEXT_LINK por un marcador __LkN__ y devuelve:
-    - texto con marcadores
-    - lista [(placeholder, url), ...]
-    """
-    if not entities:
-        return original_text, []
-
-    # Construimos sobre índices; ordenar por offset ascendente
-    items = []
-    for ent in entities:
-        if getattr(ent, "type", None) == "text_link":
-            items.append((ent.offset, ent.length, ent.url))
-    if not items:
-        return original_text, []
-
-    items.sort(key=lambda x: x[0])
-    result = []
-    pos = 0
-    placeholders = []
-    idx = 0
-    for off, length, url in items:
-        if off > pos:
-            result.append(original_text[pos:off])
-        placeholder = f"__Lk{idx}__"
-        result.append(placeholder)
-        placeholders.append((placeholder, original_text[off:off+length], url))
-        pos = off + length
-        idx += 1
-    result.append(original_text[pos:])
-    return "".join(result), [(ph, txt, url) for (ph, txt, url) in placeholders]
-
-async def _rebuild_html_with_links(masked_text: str, placeholders: List[Tuple[str, str, str]]) -> str:
-    """
-    Toma el texto MASKED ya traducido; escapa HTML y sustituye marcadores por <a href="...">texto traducido</a>.
-    """
-    escaped = html.escape(masked_text)
-    # traducimos cada título del link por separado
-    for i, (ph, link_text, url) in enumerate(placeholders):
-        translated_title = await translate_text(link_text, TARGET_LANG) if TRANSLATE else link_text
-        anchor = f'<a href="{html.escape(url, quote=True)}">{html.escape(translated_title)}</a>'
-        escaped = escaped.replace(html.escape(ph), anchor)
-    return escaped
-
-# ============ Botones: traducir SOLO el texto ============
-async def translate_inline_keyboard(markup: Optional[InlineKeyboardMarkup], target_lang: str) -> Optional[InlineKeyboardMarkup]:
+async def translate_keyboard(markup: Optional[InlineKeyboardMarkup], tgt: str) -> Optional[InlineKeyboardMarkup]:
     if not TRANSLATE_BUTTONS or not markup or not getattr(markup, "inline_keyboard", None):
         return markup
-    new_rows: List[List[InlineKeyboardButton]] = []
+    rows: List[List[InlineKeyboardButton]] = []
     for row in markup.inline_keyboard:
-        new_row: List[InlineKeyboardButton] = []
+        new_row = []
         for b in row:
             try:
-                new_text = await translate_text(b.text or "", target_lang)
+                new_text = await translate_text(b.text or "", tgt)
             except Exception:
                 new_text = b.text or ""
             new_row.append(
@@ -297,160 +156,123 @@ async def translate_inline_keyboard(markup: Optional[InlineKeyboardMarkup], targ
                     web_app=getattr(b, "web_app", None)
                 )
             )
-        new_rows.append(new_row)
-    return InlineKeyboardMarkup(new_rows)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(rows)
 
-# ============ Canal -> Canal ============
-async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def map_topic(chat_id: int, source_thread_id: Optional[int]) -> Optional[int]:
+    m1 = TOPIC_MAPPING.get(str(chat_id)) or {}
+    if not source_thread_id:
+        return None
+    dst = m1.get(str(source_thread_id))
+    return int(dst) if dst else None
+
+async def alert_admin(context: ContextTypes.DEFAULT_TYPE, text: str):
+    if ERROR_ALERT and ADMIN_ID:
+        try:
+            await context.bot.send_message(chat_id=int(ADMIN_ID), text=f"⚠️ {text[:3900]}")
+        except Exception:
+            pass
+
+# ================== REPLICACIÓN ===================
+async def replicate_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    src_msg: Message,
+    dest_chat_id: int,
+    dest_thread_id: Optional[int]
+):
+    text_plain  = src_msg.text or ""
+    caption_pln = src_msg.caption or ""
+    markup = src_msg.reply_markup
+
+    if text_plain:
+        out_text = await translate_text(text_plain, TARGET_LANG)
+        out_kb   = await translate_keyboard(markup, TARGET_LANG)
+        await context.bot.send_message(
+            chat_id=dest_chat_id,
+            message_thread_id=dest_thread_id,
+            text=out_text,
+            reply_markup=out_kb,
+            disable_web_page_preview=True
+        )
+    elif src_msg.photo or src_msg.video or src_msg.document or src_msg.animation or src_msg.audio or src_msg.voice:
+        out_caption = await translate_text(caption_pln, TARGET_LANG) if caption_pln else None
+        out_kb      = await translate_keyboard(markup, TARGET_LANG)
+        # copiar media con caption traducida
+        await context.bot.copy_message(
+            chat_id=dest_chat_id,
+            from_chat_id=src_msg.chat.id,
+            message_id=src_msg.message_id,
+            message_thread_id=dest_thread_id,
+            caption=out_caption,
+            reply_markup=out_kb
+        )
+    else:
+        # otros tipos (stickers, etc.) → copiar sin traducir
+        await context.bot.copy_message(
+            chat_id=dest_chat_id,
+            from_chat_id=src_msg.chat.id,
+            message_id=src_msg.message_id,
+            message_thread_id=dest_thread_id
+        )
+
+# --------- CANALES: SOURCE_CHANNEL → DEST_CHANNEL
+def channel_matches(update: Update) -> bool:
+    if not update.channel_post: return False
+    chat = update.channel_post.chat
+    if SOURCE_CHANNEL.startswith("@"):
+        uname = (chat.username or "").lower()
+        return ("@" + uname) == SOURCE_CHANNEL.lower()
+    else:
+        return str(chat.id) == SOURCE_CHANNEL
+
+async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not update.channel_post or not _chat_matches_source(update):
+        if not update.channel_post or not channel_matches(update):
             return
         msg = update.channel_post
-
-        if not TRANSLATE:
-            await context.bot.copy_message(
-                chat_id=DEST_CHANNEL,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-            )
-            return
-
-        text_plain = msg.text or ""
-        caption_plain = msg.caption or ""
-
-        if text_plain.strip():
-            masked, phs = _mask_text_links(text_plain, msg.entities)
-            translated_masked = await translate_text(masked, TARGET_LANG)
-            html_out = await _rebuild_html_with_links(translated_masked, phs)
-            translated_markup = await translate_inline_keyboard(msg.reply_markup, TARGET_LANG)
-            for i, chunk in enumerate(_split_chunks(html_out, 4096)):
-                await context.bot.send_message(
-                    chat_id=DEST_CHANNEL,
-                    text=chunk,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=translated_markup if i == 0 else None
-                )
-        else:
-            # media con caption
-            masked, phs = _mask_text_links(caption_plain, msg.caption_entities or [])
-            translated_masked = await translate_text(masked, TARGET_LANG)
-            html_out = await _rebuild_html_with_links(translated_masked, phs) if translated_masked else None
-            translated_markup = await translate_inline_keyboard(msg.reply_markup, TARGET_LANG)
-
-            await context.bot.copy_message(
-                chat_id=DEST_CHANNEL,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                caption=html_out if html_out else None,
-                parse_mode="HTML" if html_out else None,
-                reply_markup=translated_markup
-            )
-
+        await replicate_message(context, msg, int(DEST_CHANNEL), None)
     except Exception as e:
-        logger.exception("Error en on_channel_post")
-        if ADMIN_USER_ID:
-            try:
-                await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"❗️Error canal→canal: {e}")
-            except Exception:
-                pass
+        log.exception("Error on_channel_post")
+        await alert_admin(context, f"Error canal→canal: {e}\n{traceback.format_exc()[:1500]}")
 
-# ============ Grupos/Temas ============
-def _route_for_message(msg) -> Optional[Dict]:
-    if not msg.is_topic_message:
-        return None
-    key = (msg.chat.id, msg.message_thread_id)
-    return TOPIC_MAP.get(key)
-
-async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# --------- GRUPOS/TEMAS: según TOPIC_MAPPING
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        msg = update.message
-        if not msg or not msg.is_topic_message:
+        if not update.message:  # sólo mensajes normales de grupo/tema
+            return
+        msg: Message = update.message
+        chat: Chat   = msg.chat
+        if chat.type not in ("supergroup", "group"):
             return
 
-        route = _route_for_message(msg)
-        if not route:
-            return
+        # Necesitamos un destino para este grupo/tema
+        dest_thread = map_topic(chat.id, msg.message_thread_id)
+        if dest_thread is None:
+            return  # no mapeado → se ignora
 
-        # filtro por usuario (CHAT 1 -> CHAT ROOM solo tú)
-        only_uid = route.get("only_from_user")
-        if only_uid and (not msg.from_user or msg.from_user.id != only_uid):
-            return
-
-        dst_chat = msg.chat.id
-        dst_thread = route["dst_topic"]
-
-        if not TRANSLATE:
-            await context.bot.copy_message(
-                chat_id=dst_chat,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                message_thread_id=dst_thread,
-            )
-            return
-
-        text_plain = msg.text or ""
-        caption_plain = msg.caption or ""
-
-        if text_plain.strip():
-            masked, phs = _mask_text_links(text_plain, msg.entities)
-            translated_masked = await translate_text(masked, TARGET_LANG)
-            html_out = await _rebuild_html_with_links(translated_masked, phs)
-            translated_markup = await translate_inline_keyboard(msg.reply_markup, TARGET_LANG)
-
-            for i, chunk in enumerate(_split_chunks(html_out, 4096)):
-                await context.bot.send_message(
-                    chat_id=dst_chat,
-                    text=chunk,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=translated_markup if i == 0 else None,
-                    message_thread_id=dst_thread,
-                )
-        else:
-            masked, phs = _mask_text_links(caption_plain, msg.caption_entities or [])
-            translated_masked = await translate_text(masked, TARGET_LANG)
-            html_out = await _rebuild_html_with_links(translated_masked, phs) if translated_masked else None
-            translated_markup = await translate_inline_keyboard(msg.reply_markup, TARGET_LANG)
-
-            await context.bot.copy_message(
-                chat_id=dst_chat,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                message_thread_id=dst_thread,
-                caption=html_out if html_out else None,
-                parse_mode="HTML" if html_out else None,
-                reply_markup=translated_markup
-            )
+        # Destino SIEMPRE es el MISMO grupo (réplica tema→tema)
+        await replicate_message(context, msg, chat.id, dest_thread)
 
     except Exception as e:
-        logger.exception("Error en on_group_message")
-        if ADMIN_USER_ID:
-            try:
-                await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"❗️Error grupos/temas: {e}")
-            except Exception:
-                pass
+        log.exception("Error on_group_message")
+        await alert_admin(context, f"Error grupo/tema: {e}\n{traceback.format_exc()[:1500]}")
 
-# ============ Arranque ============
+# ================== MAIN ==========================
 def main():
-    _ensure_env()
+    need_vars(("BOT_TOKEN", BOT_TOKEN))
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Canal -> canal
+    # canales
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
 
-    # Grupos/temas (foros)
-    app.add_handler(
-        MessageHandler(filters.ChatType.GROUPS & (~filters.StatusUpdate.ALL), on_group_message)
-    )
+    # grupos/temas
+    app.add_handler(MessageHandler(filters.ChatType.SUPERGROUP | filters.ChatType.GROUP, on_group_message))
 
     app.run_polling(
-        allowed_updates=["channel_post", "message"],
+        allowed_updates=["message","channel_post"],
         poll_interval=1.3,
-        stop_signals=None,
+        stop_signals=None
     )
 
 if __name__ == "__main__":
     main()
-
-

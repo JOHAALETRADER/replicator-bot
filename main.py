@@ -49,20 +49,14 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s
 log = logging.getLogger("replicator")
 
 # ================== CANAL → CANAL ==================
-# Puedes dejar @username, pero con IDs -100... es más estable. También existen las variables ENV abajo.
 CHANNEL_MAP: Dict[Any, Any] = {
     "@johaaletrader_es": "@johaaletrader_en",
 }
 
-# Lectura de ENV para canal→canal (toma prioridad si coinciden)
 ENV_SRC = (os.getenv("SOURCE_CHANNEL", "") or "").strip() or None
 ENV_DST = (os.getenv("DEST_CHANNEL", "") or "").strip() or None
 
 def _norm_chan(x: Any) -> tuple[Optional[str], Optional[int]]:
-    """
-    Normaliza un canal como (@username, id_num).
-    Retorna (username_con_@, id_num) cuando se pueda.
-    """
     if x is None:
         return (None, None)
     if isinstance(x, int):
@@ -83,34 +77,36 @@ ENV_SRC_UNAME, ENV_SRC_ID = _norm_chan(ENV_SRC)
 ENV_DST_UNAME, ENV_DST_ID = _norm_chan(ENV_DST)
 
 # ================== GRUPOS / TEMAS ==================
-# Tus grupos
 G1 = -1001946870620
 G4 = -1002725606859
 G2 = -1002131156976
 G5 = -1002569975479
 G3 = -1002127373425
 
-# Formato: (src_chat, src_thread) -> (dst_chat, dst_thread, only_sender_id | None)
+# ← NUEVO: tu ID real para el Chat
+CHAT_OWNER_ID = 5958164558
+
+# (src_chat, src_thread) -> (dst_chat, dst_thread, only_sender_id | None)
 TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
     # Grupo 1 → Grupo 4
-    (G1, 129):   (G4, 8,   None),          # Resultados JT Traders → JT Wins
-    (G1, 1):     (G4, 10,  5958164558),    # Chat → Chat Room (solo tú)
-    (G1, 2890):  (G4, 6,   None),          # Resultados Alumnos → VIP Results & Payouts
-    (G1, 17373): (G4, 6,   None),          # Retiros VIP → VIP Results & Payouts
-    (G1, 8):     (G4, 2,   None),          # Estrategias/Archivos → Trading Plan & Risk
-    (G1, 11):    (G4, 2,   None),          # Plan & Gestión de Riesgo → Trading Plan & Risk
-    (G1, 9):     (G4, 12,  None),          # Noticias y Sorteos → Updates & Prizes
+    (G1, 129):   (G4, 8,   None),
+    (G1, 1):     (G4, 10,  CHAT_OWNER_ID),   # Chat → Chat Room (solo tú)
+    (G1, 2890):  (G4, 6,   None),
+    (G1, 17373): (G4, 6,   None),
+    (G1, 8):     (G4, 2,   None),
+    (G1, 11):    (G4, 2,   None),
+    (G1, 9):     (G4, 12,  None),
 
     # Grupo 2 → Grupo 5
-    (G2, 2):     (G5, 2,   None),          # Synthetic Index Signals → Synthetic Index Signals
-    (G2, 5337):  (G5, 8,   None),          # Binance Master Signals → Binance Pro Signals
-    (G2, 3):     (G5, 10,  None),          # Binary Signals → Binary Trade Signals
-    (G2, 4):     (G5, 5,   None),          # Forex Bias → Market Insights & Analysis
-    (G2, 272):   (G5, 5,   None),          # Noticias y Análisis → Market Insights & Analysis
+    (G2, 2):     (G5, 2,   None),
+    (G2, 5337):  (G5, 8,   None),
+    (G2, 3):     (G5, 10,  None),
+    (G2, 4):     (G5, 5,   None),
+    (G2, 272):   (G5, 5,   None),
 
     # Grupo 3 (mismo grupo)
-    (G3, 3):     (G3, 4096, None),         # Resultados JT Traders Teams → JT Wins
-    (G3, 2):     (G3, 4098, None),         # Resultados Alumnos VIP → VIP Results & Risk
+    (G3, 3):     (G3, 4096, None),
+    (G3, 2):     (G3, 4098, None),
 }
 
 # ================== HEURÍSTICA DE IDIOMA ==================
@@ -213,9 +209,8 @@ bullish\tbullish
 bearish\tbearish
 """
 
-# ================== TRADUCCIÓN (DEEPL + GLOSARIO) ==================
 DEEPL_FORMALITY_LANGS = {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}
-_glossary_id_mem: Optional[str] = None  # cache en memoria para esta ejecución
+_glossary_id_mem: Optional[str] = None
 
 async def deepl_create_glossary_if_needed() -> Optional[str]:
     global _glossary_id_mem, GLOSSARY_ID
@@ -264,7 +259,6 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
     if not FORCE_TRANSLATE and probably_english(text):
         return text
 
-    # asegurar glosario disponible (si procede)
     gid = _glossary_id_mem or GLOSSARY_ID or ""
     if not gid and (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV):
         try:
@@ -344,7 +338,6 @@ async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tu
     async with aiohttp.ClientSession(timeout=timeout) as session:
         new_frags: List[Tuple[str, Dict[str, Any]]] = []
         for frag, meta in frags:
-            # traducimos contenido visible; preservamos href/formatos
             if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
                 new_text = await deepl_translate(frag, session=session)
                 new_frags.append((new_text, meta))
@@ -379,43 +372,55 @@ async def translate_buttons(markup: Optional[InlineKeyboardMarkup]) -> Optional[
 
 # ================== MAPEO ==================
 def map_channel(src_chat: Chat) -> Optional[int | str]:
-    """
-    Devuelve el destino del canal origen. Prioridad:
-      1) Par de ENV (SOURCE_CHANNEL -> DEST_CHANNEL), por id o por @
-      2) CHANNEL_MAP (acepta claves por id, str(id) o @username en minúsculas)
-    """
     src_id = int(src_chat.id)
     src_uname = ("@" + (src_chat.username or "").lower()) if src_chat.username else None
 
-    # 1) ENV directo (por id o @)
     if ENV_SRC_ID is not None and src_id == ENV_SRC_ID:
         return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
     if ENV_SRC_UNAME and src_uname and src_uname == ENV_SRC_UNAME:
         return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
 
-    # 2) CHANNEL_MAP
-    if src_id in CHANNEL_MAP:                 # clave int
+    if src_id in CHANNEL_MAP:
         return CHANNEL_MAP[src_id]
-    if str(src_id) in CHANNEL_MAP:            # clave str del id
+    if str(src_id) in CHANNEL_MAP:
         return CHANNEL_MAP[str(src_id)]
-    if src_uname and src_uname in CHANNEL_MAP:  # clave @username
+    if src_uname and src_uname in CHANNEL_MAP:
         return CHANNEL_MAP[src_uname]
 
     return None
 
 def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optional[int]) -> Optional[Tuple[int,int]]:
     """
-    Mapea (chat, thread) → (chat, thread), respetando filtro de remitente si lo hay.
-    Si thread_id viene None (pasa en Chat/General), lo tratamos como 1.
+    Mapea (chat, thread) → (chat, thread). Reglas:
+      1) Coincidencia exacta en TOPIC_ROUTES.
+      2) Si thread_id es None/0, normaliza a 1.
+      3) Fallback para el Chat del Grupo 1: si el mensaje es tuyo o Telegram
+         no manda from_user (sender_id=None), envía a G4#10.
     """
-    tid = src_thread_id if src_thread_id is not None else 1
+    # 1) exacto
+    if src_thread_id is not None:
+        route = TOPIC_ROUTES.get((src_chat_id, src_thread_id))
+        if route:
+            dst_chat, dst_thread, only_sender = route
+            if only_sender and sender_id and sender_id != only_sender:
+                return None
+            return (dst_chat, dst_thread)
+
+    # 2) normalización General→1
+    tid = 1 if (src_thread_id in (None, 0)) else src_thread_id
     route = TOPIC_ROUTES.get((src_chat_id, tid))
-    if not route:
-        return None
-    dst_chat, dst_thread, only_sender = route
-    if only_sender and sender_id and sender_id != only_sender:
-        return None
-    return (dst_chat, dst_thread)
+    if route:
+        dst_chat, dst_thread, only_sender = route
+        if only_sender and sender_id and sender_id != only_sender:
+            return None
+        return (dst_chat, dst_thread)
+
+    # 3) fallback seguro para Chat del G1
+    if src_chat_id == G1 and (src_thread_id in (None, 0, 1)):
+        if sender_id is None or sender_id == CHAT_OWNER_ID:
+            return (G4, 10)
+
+    return None
 
 async def alert_error(context: ContextTypes.DEFAULT_TYPE, text: str):
     if ERROR_ALERT and ADMIN_ID:
@@ -450,7 +455,7 @@ async def copy_with_translated_caption(context: ContextTypes.DEFAULT_TYPE, chat_
             message_id=msg.message_id,
             caption=cap_html,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb,  # si el API lo permite; si no, simplemente omítelo
+            reply_markup=kb,
         )
     else:
         await context.bot.copy_message(

@@ -24,7 +24,7 @@ from telegram.ext import (
 # ================== CONFIG BÁSICA ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Traducción
+# Traducción (global por defecto)
 TRANSLATE = os.getenv("TRANSLATE", "true").lower() == "true"
 TRANSLATOR = "deepl"
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "384e6eb2-922a-43ce-8e8f-7cd3ac0047b7").strip()
@@ -85,7 +85,7 @@ G3 = -1002127373425
 
 # ← Tu ID para filtrar el Chat
 CHAT_OWNER_ID = 5958164558
-# ← NUEVO: ID del “Anonymous Admin” de Telegram
+# ← ID del “Anonymous Admin” de Telegram
 ANON_ADMIN_ID = 1087968824
 
 # (src_chat, src_thread) -> (dst_chat, dst_thread, only_sender_id | None)
@@ -108,17 +108,27 @@ TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
 
     # Grupo 3 (mismo grupo)
     (G3, 3):     (G3, 4096, None),
-    (G3, 2):     (G3, 4098, None),  # ← NUEVO: ES → EN dentro del mismo grupo (lo que llegue a /2 se replica a /4098)
+    (G3, 2):     (G3, 4098, None),  # ES → EN dentro del mismo grupo
 }
 
-# ================== FAN-OUT OPCIONAL (RUTAS ADICIONALES) ==================
-# Envía el mismo mensaje a destinos extra, además del destino principal de TOPIC_ROUTES.
-# Formato: (src_chat, src_thread) -> [(dst_chat, dst_thread), ...]
+# ================== FAN-OUT OPCIONAL ==================
+# (src_chat, src_thread) -> [(dst_chat, dst_thread), ...]
 FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
-    # G1: Resultados Alumnos y Retiros VIP → además a G3#2 (ES)
+    # De G1 (ES) también a G3#2 (ES)
     (G1, 2890): [(G3, 2)],
     (G1, 17373): [(G3, 2)],
 }
+
+# ================== OVERRIDE DE TRADUCCIÓN POR RUTA ==================
+# Para ciertas rutas queremos NO traducir (pasar ES tal cual).
+# Formato: set((src_chat, src_thread, dst_chat, dst_thread))
+NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
+    # Lo nuevo: G1#2890 → G3#2 y G1#17373 → G3#2 deben llegar en ESPAÑOL sin traducir
+    (G1, 2890, G3, 2),
+    (G1, 17373, G3, 2),
+}
+# El resto usa el comportamiento global (TRANSLATE=True) y por tanto
+# G3#2 → G3#4098 saldrá en INGLÉS (como querías).
 
 # ================== HEURÍSTICA DE IDIOMA ==================
 _EN_COMMON = re.compile(r"\b(the|and|for|with|from|to|of|in|on|is|are|you|we|they|buy|sell|trade|signal|profit|setup|account)\b", re.I)
@@ -154,7 +164,6 @@ def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str
         elif e.type in ("underline",): meta["tag"] = "u"
         elif e.type in ("strikethrough",): meta["tag"] = "s"
         elif e.type in ("code",): meta["tag"] = "code"
-        elif e.type in ("pre",): meta["tag"] = "pre"
         elif e.type == "text_link" and e.url:
             meta["tag"] = "a"; meta["href"] = e.url
         else:
@@ -220,8 +229,9 @@ bullish\tbullish
 bearish\tbearish
 """
 
+# ================== TRADUCCIÓN (DEEPL + GLOSARIO) ==================
 DEEPL_FORMALITY_LANGS = {"DE","FR","IT","ES","NL","PL","PT-PT","PT-BR","RU","JA"}
-_glossary_id_mem: Optional[str] = None
+_glossary_id_mem: Optional[str] = None  # cache en memoria para esta ejecución
 
 async def deepl_create_glossary_if_needed() -> Optional[str]:
     global _glossary_id_mem, GLOSSARY_ID
@@ -297,52 +307,9 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         js = await r.json()
         return js["translations"][0]["text"]
 
-def escape(t: str) -> str:
-    return html.escape(t, quote=False)
-
-def build_html(fragments: List[Tuple[str, Dict[str, Any]]]) -> str:
-    out: List[str] = []
-    for frag, meta in fragments:
-        safe = escape(frag)
-        tag = meta.get("tag")
-        if not tag:
-            out.append(safe); continue
-        if tag == "a":
-            href = html.escape(meta.get("href", ""), quote=True)
-            out.append(f'<a href="{href}">{safe}</a>')
-        elif tag in {"b","strong","i","em","u","s","del","code","pre","a"}:
-            out.append(f"<{tag}>{safe}</{tag}>")
-        else:
-            out.append(safe)
-    return "".join(out)
-
-def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str, Dict[str, Any]]]:
-    if not entities:
-        return [(text, {})]
-    entities = sorted(entities, key=lambda e: e.offset)
-    res: List[Tuple[str, Dict[str, Any]]] = []
-    idx = 0
-    for e in entities:
-        if e.offset > idx:
-            res.append((text[idx:e.offset], {}))
-        frag = text[e.offset:e.offset + e.length]
-        meta: Dict[str, Any] = {}
-        if e.type in ("bold",): meta["tag"] = "b"
-        elif e.type in ("italic",): meta["tag"] = "i"
-        elif e.type in ("underline",): meta["tag"] = "u"
-        elif e.type in ("strikethrough",): meta["tag"] = "s"
-        elif e.type in ("code",): meta["tag"] = "code"
-        elif e.type == "text_link" and e.url:
-            meta["tag"] = "a"; meta["href"] = e.url
-        else:
-            meta = {}
-        res.append((frag, meta))
-        idx = e.offset + e.length
-    if idx < len(text):
-        res.append((text[idx:], {}))
-    return res
-
+# ================== TRADUCCIÓN VISIBLE (con override por ruta) ==================
 async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
+    # Traducción normal (global)
     frags = entities_to_html(text, entities or [])
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -356,8 +323,14 @@ async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tu
     html_text = build_html(new_frags)
     return html_text, []
 
-async def translate_buttons(markup: Optional[InlineKeyboardMarkup]) -> Optional[InlineKeyboardMarkup]:
+def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
+    # Pasa el texto tal cual, solo aplicando formato y links
+    return build_html(entities_to_html(text, entities or []))
+
+async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_translate: bool) -> Optional[InlineKeyboardMarkup]:
     if not markup or not TRANSLATE_BUTTONS or not getattr(markup, "inline_keyboard", None):
+        return markup
+    if not do_translate:
         return markup
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -413,10 +386,8 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
         if route:
             dst_chat, dst_thread, only_sender = route
             if only_sender:
-                # Permitir si es el owner normal...
                 if sender_id == only_sender:
                     return (dst_chat, dst_thread)
-                # ...o si es el Anonymous Admin en el Chat del G1
                 if (src_chat_id == G1 and src_thread_id in (None, 0, 1) and sender_id == ANON_ADMIN_ID):
                     return (dst_chat, dst_thread)
                 return None
@@ -437,6 +408,10 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
 
     return None
 
+def route_no_translate(src_chat: int, src_thread: Optional[int], dst_chat: int, dst_thread: int) -> bool:
+    tid = src_thread if src_thread is not None else 1
+    return (src_chat, tid, dst_chat, dst_thread) in NO_TRANSLATE_ROUTES
+
 async def alert_error(context: ContextTypes.DEFAULT_TYPE, text: str):
     if ERROR_ALERT and ADMIN_ID:
         try:
@@ -445,9 +420,13 @@ async def alert_error(context: ContextTypes.DEFAULT_TYPE, text: str):
             pass
 
 # ================== REPLICACIÓN ==================
-async def send_translated_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int], msg: Message):
-    html_text, _ = await translate_visible_html(msg.text or "", msg.entities or [])
-    kb = await translate_buttons(msg.reply_markup)
+async def send_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int],
+                    msg: Message, *, do_translate: bool):
+    if do_translate and TRANSLATE:
+        html_text, _ = await translate_visible_html(msg.text or "", msg.entities or [])
+    else:
+        html_text = build_html_no_translate(msg.text or "", msg.entities or [])
+    kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
     await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=thread_id,
@@ -457,12 +436,16 @@ async def send_translated_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int 
         reply_markup=kb,
     )
 
-async def copy_with_translated_caption(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int], msg: Message):
+async def copy_with_caption(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int],
+                            msg: Message, *, do_translate: bool):
     cap_text = msg.caption or ""
     cap_entities = msg.caption_entities or []
     if cap_text.strip():
-        cap_html, _ = await translate_visible_html(cap_text, cap_entities)
-        kb = await translate_buttons(msg.reply_markup)
+        if do_translate and TRANSLATE:
+            cap_html, _ = await translate_visible_html(cap_text, cap_entities)
+        else:
+            cap_html = build_html_no_translate(cap_text, cap_entities)
+        kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
         await context.bot.copy_message(
             chat_id=chat_id,
             message_thread_id=thread_id,
@@ -480,11 +463,13 @@ async def copy_with_translated_caption(context: ContextTypes.DEFAULT_TYPE, chat_
             message_id=msg.message_id,
         )
 
-async def replicate_message(context: ContextTypes.DEFAULT_TYPE, src_msg: Message, dest_chat_id: int | str, dest_thread_id: Optional[int]):
+async def replicate_message(context: ContextTypes.DEFAULT_TYPE, src_msg: Message,
+                            dest_chat_id: int | str, dest_thread_id: Optional[int],
+                            *, do_translate: bool):
     if src_msg.text:
-        await send_translated_text(context, dest_chat_id, dest_thread_id, src_msg)
+        await send_text(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
         return
-    await copy_with_translated_caption(context, dest_chat_id, dest_thread_id, src_msg)
+    await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
 
 # ================== HANDLERS ==================
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,7 +481,8 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not dst:
             return
         log.info("Channel %s (id=%s) → %s | msg %s", msg.chat.username, msg.chat.id, dst, msg.message_id)
-        await replicate_message(context, msg, dst, None)
+        # Para canales mantenemos la traducción global
+        await replicate_message(context, msg, dst, None, do_translate=True)
     except Exception as e:
         log.exception("Error on_channel_post")
         await alert_error(context, f"on_channel_post: {e}")
@@ -513,7 +499,6 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thread_id = msg.message_thread_id
         sender_id = msg.from_user.id if msg.from_user else None
 
-        # DEBUG extra para el CHAT del Grupo 1
         if chat.id == G1:
             logging.info(f"[CHAT DEBUG] thread_id={thread_id} sender={sender_id}")
 
@@ -521,16 +506,24 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not route:
             return
         dst_chat, dst_thread = route
-        log.info("Group %s#%s → %s#%s | msg %s", chat.id, thread_id if thread_id is not None else 1, dst_chat, dst_thread, msg.message_id)
-        await replicate_message(context, msg, dst_chat, dst_thread)
+
+        # ¿Esta ruta específica debe NO traducir?
+        do_translate_main = not route_no_translate(chat.id, thread_id, dst_chat, dst_thread)
+
+        log.info("Group %s#%s → %s#%s | translate=%s | msg %s",
+                 chat.id, thread_id if thread_id is not None else 1,
+                 dst_chat, dst_thread, do_translate_main, msg.message_id)
+
+        await replicate_message(context, msg, dst_chat, dst_thread, do_translate=do_translate_main)
 
         # --- FAN-OUT EXTRA ---
         tid_norm = thread_id if thread_id is not None else 1
         extras = FANOUT_ROUTES.get((chat.id, tid_norm), [])
         for extra_chat, extra_thread in extras:
-            log.info("Fanout %s#%s → %s#%s | msg %s",
-                     chat.id, tid_norm, extra_chat, extra_thread, msg.message_id)
-            await replicate_message(context, msg, extra_chat, extra_thread)
+            do_translate_extra = not route_no_translate(chat.id, thread_id, extra_chat, extra_thread)
+            log.info("Fanout %s#%s → %s#%s | translate=%s | msg %s",
+                     chat.id, tid_norm, extra_chat, extra_thread, do_translate_extra, msg.message_id)
+            await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra)
 
     except Exception as e:
         log.exception("Error on_group_post")

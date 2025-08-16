@@ -85,37 +85,42 @@ G3 = -1002127373425
 
 # ← Tu ID para filtrar el Chat
 CHAT_OWNER_ID = 5958164558
-# ← NUEVO: ID del “Anonymous Admin” de Telegram
+# ← ID del “Anonymous Admin” de Telegram (por si Telegram oculta el remitente)
 ANON_ADMIN_ID = 1087968824
 
 # (src_chat, src_thread) -> (dst_chat, dst_thread, only_sender_id | None)
 TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
-    # Grupo 1 → Grupo 4
+    # Grupo 1 → Grupo 4 (como ya estaba)
     (G1, 129):   (G4, 8,   None),
-    (G1, 1):     (G4, 10,  CHAT_OWNER_ID),   # Chat → Chat Room (solo tú; con excepción para Anonymous Admin más abajo)
+    (G1, 1):     (G4, 10,  CHAT_OWNER_ID),   # Chat → Chat Room (solo tú)
     (G1, 2890):  (G4, 6,   None),
     (G1, 17373): (G4, 6,   None),
     (G1, 8):     (G4, 2,   None),
     (G1, 11):    (G4, 2,   None),
     (G1, 9):     (G4, 12,  None),
 
-    # Grupo 2 → Grupo 5
+    # Grupo 2 → Grupo 5 (como ya estaba)
     (G2, 2):     (G5, 2,   None),
     (G2, 5337):  (G5, 8,   None),
     (G2, 3):     (G5, 10,  None),
     (G2, 4):     (G5, 5,   None),
     (G2, 272):   (G5, 5,   None),
 
-    # Grupo 3 (mismo grupo)
+    # Grupo 3 (mismo grupo, como ya estaba)
     (G3, 3):     (G3, 4096, None),
-    (G3, 2):     (G3, 4098, None),
+    (G3, 2):     (G3, 4098, None),  # ← NUEVO: de G3#2 a G3#4098 (traducir a EN)
 }
 
-# ================== FAN-OUT OPCIONAL (RUTAS ADICIONALES) ==================
-# Envía el mismo mensaje a destinos extra, además del destino principal de TOPIC_ROUTES.
-# Formato: (src_chat, src_thread) -> [(dst_chat, dst_thread), ...]
+# Fan-out adicional (se mantiene vacío salvo los casos que quieras duplicar)
 FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
-    # G1: Resultados Alumnos y Retiros VIP → además a G3#2
+    # ← NUEVO: duplicar G1#2890 y G1#17373 también hacia G3#2
+    (G1, 2890): [(G3, 2)],
+    (G1, 17373): [(G3, 2)],
+}
+
+# ← NUEVO: rutas que deben ir SIN traducción (copiar tal cual)
+# En tu caso, solo saltamos la traducción cuando el destino es exactamente G3#2
+NO_TRANSLATE_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
     (G1, 2890): [(G3, 2)],
     (G1, 17373): [(G3, 2)],
 }
@@ -154,7 +159,6 @@ def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str
         elif e.type in ("underline",): meta["tag"] = "u"
         elif e.type in ("strikethrough",): meta["tag"] = "s"
         elif e.type in ("code",): meta["tag"] = "code"
-        elif e.type in ("pre",): meta["tag"] = "pre"
         elif e.type == "text_link" and e.url:
             meta["tag"] = "a"; meta["href"] = e.url
         else:
@@ -356,6 +360,12 @@ async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tu
     html_text = build_html(new_frags)
     return html_text, []
 
+# ← NUEVO: render sin traducir (respeta entidades)
+def render_visible_html_no_translate(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
+    frags = entities_to_html(text, entities or [])
+    html_text = build_html(frags)
+    return html_text, []
+
 async def translate_buttons(markup: Optional[InlineKeyboardMarkup]) -> Optional[InlineKeyboardMarkup]:
     if not markup or not TRANSLATE_BUTTONS or not getattr(markup, "inline_keyboard", None):
         return markup
@@ -399,13 +409,15 @@ def map_channel(src_chat: Chat) -> Optional[int | str]:
 
     return None
 
-def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optional[int]) -> Optional[Tuple[int,int]]:
+def _route_has_no_translate(src_chat_id: int, src_thread_id_norm: int, dst_chat: int, dst_thread: int) -> bool:
+    pairs = NO_TRANSLATE_ROUTES.get((src_chat_id, src_thread_id_norm), [])
+    return (dst_chat, dst_thread) in pairs
+
+def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optional[int]) -> Optional[Tuple[int,int,Optional[bool]]]:
     """
-    Mapea (chat, thread) → (chat, thread). Reglas:
-      1) Coincidencia exacta en TOPIC_ROUTES.
-      2) Si thread_id es None/0, normaliza a 1 y vuelve a buscar.
-      3) Excepción para el CHAT del Grupo 1: si only_sender=CHAT_OWNER_ID
-         y el remitente es el Anonymous Admin (1087968824), también permite replicar.
+    Mapea (chat, thread) → (chat, thread) y devuelve (dst_chat, dst_thread, no_translate?).
+    - Respeta filtro de remitente (CHAT del G1 solo tú / Anonymous Admin).
+    - Añade bandera no_translate si está configurado en NO_TRANSLATE_ROUTES.
     """
     # 1) exacto primero
     if src_thread_id is not None:
@@ -413,14 +425,14 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
         if route:
             dst_chat, dst_thread, only_sender = route
             if only_sender:
-                # Permitir si es el owner normal...
                 if sender_id == only_sender:
-                    return (dst_chat, dst_thread)
-                # ...o si es el Anonymous Admin en el Chat del G1
-                if (src_chat_id == G1 and src_thread_id in (None, 0, 1) and sender_id == ANON_ADMIN_ID):
-                    return (dst_chat, dst_thread)
-                return None
-            return (dst_chat, dst_thread)
+                    pass
+                elif (src_chat_id == G1 and src_thread_id in (None, 0, 1) and sender_id == ANON_ADMIN_ID):
+                    pass
+                else:
+                    return None
+            nt = _route_has_no_translate(src_chat_id, src_thread_id, dst_chat, dst_thread)
+            return (dst_chat, dst_thread, nt)
 
     # 2) normalización General→1
     tid = 1 if (src_thread_id in (None, 0)) else src_thread_id
@@ -429,11 +441,13 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
         dst_chat, dst_thread, only_sender = route
         if only_sender:
             if sender_id == only_sender:
-                return (dst_chat, dst_thread)
-            if (src_chat_id == G1 and tid == 1 and sender_id == ANON_ADMIN_ID):
-                return (dst_chat, dst_thread)
-            return None
-        return (dst_chat, dst_thread)
+                pass
+            elif (src_chat_id == G1 and tid == 1 and sender_id == ANON_ADMIN_ID):
+                pass
+            else:
+                return None
+        nt = _route_has_no_translate(src_chat_id, tid, dst_chat, dst_thread)
+        return (dst_chat, dst_thread, nt)
 
     return None
 
@@ -445,9 +459,12 @@ async def alert_error(context: ContextTypes.DEFAULT_TYPE, text: str):
             pass
 
 # ================== REPLICACIÓN ==================
-async def send_translated_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int], msg: Message):
-    html_text, _ = await translate_visible_html(msg.text or "", msg.entities or [])
-    kb = await translate_buttons(msg.reply_markup)
+async def send_translated_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int], msg: Message, *, no_translate: bool = False):
+    if no_translate:
+        html_text, _ = render_visible_html_no_translate(msg.text or "", msg.entities or [])
+    else:
+        html_text, _ = await translate_visible_html(msg.text or "", msg.entities or [])
+    kb = await translate_buttons(msg.reply_markup) if not no_translate else msg.reply_markup
     await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=thread_id,
@@ -457,12 +474,16 @@ async def send_translated_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int 
         reply_markup=kb,
     )
 
-async def copy_with_translated_caption(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int], msg: Message):
+async def copy_with_translated_caption(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int], msg: Message, *, no_translate: bool = False):
     cap_text = msg.caption or ""
     cap_entities = msg.caption_entities or []
     if cap_text.strip():
-        cap_html, _ = await translate_visible_html(cap_text, cap_entities)
-        kb = await translate_buttons(msg.reply_markup)
+        if no_translate:
+            cap_html, _ = render_visible_html_no_translate(cap_text, cap_entities)
+            kb = msg.reply_markup
+        else:
+            cap_html, _ = await translate_visible_html(cap_text, cap_entities)
+            kb = await translate_buttons(msg.reply_markup)
         await context.bot.copy_message(
             chat_id=chat_id,
             message_thread_id=thread_id,
@@ -480,11 +501,11 @@ async def copy_with_translated_caption(context: ContextTypes.DEFAULT_TYPE, chat_
             message_id=msg.message_id,
         )
 
-async def replicate_message(context: ContextTypes.DEFAULT_TYPE, src_msg: Message, dest_chat_id: int | str, dest_thread_id: Optional[int]):
+async def replicate_message(context: ContextTypes.DEFAULT_TYPE, src_msg: Message, dest_chat_id: int | str, dest_thread_id: Optional[int], *, no_translate: bool = False):
     if src_msg.text:
-        await send_translated_text(context, dest_chat_id, dest_thread_id, src_msg)
+        await send_translated_text(context, dest_chat_id, dest_thread_id, src_msg, no_translate=no_translate)
         return
-    await copy_with_translated_caption(context, dest_chat_id, dest_thread_id, src_msg)
+    await copy_with_translated_caption(context, dest_chat_id, dest_thread_id, src_msg, no_translate=no_translate)
 
 # ================== HANDLERS ==================
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,7 +517,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not dst:
             return
         log.info("Channel %s (id=%s) → %s | msg %s", msg.chat.username, msg.chat.id, dst, msg.message_id)
-        await replicate_message(context, msg, dst, None)
+        await replicate_message(context, msg, dst, None, no_translate=False)
     except Exception as e:
         log.exception("Error on_channel_post")
         await alert_error(context, f"on_channel_post: {e}")
@@ -513,24 +534,25 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thread_id = msg.message_thread_id
         sender_id = msg.from_user.id if msg.from_user else None
 
-        # DEBUG extra para el CHAT del Grupo 1
         if chat.id == G1:
             logging.info(f"[CHAT DEBUG] thread_id={thread_id} sender={sender_id}")
 
-        route = map_topic(chat.id, thread_id, sender_id)
-        if not route:
+        mapped = map_topic(chat.id, thread_id, sender_id)
+        if not mapped:
             return
-        dst_chat, dst_thread = route
-        log.info("Group %s#%s → %s#%s | msg %s", chat.id, thread_id if thread_id is not None else 1, dst_chat, dst_thread, msg.message_id)
-        await replicate_message(context, msg, dst_chat, dst_thread)
+        dst_chat, dst_thread, no_trans = mapped
+        log.info("Group %s#%s → %s#%s | msg %s | no_translate=%s",
+                 chat.id, thread_id if thread_id is not None else 1, dst_chat, dst_thread, msg.message_id, no_trans)
+        await replicate_message(context, msg, dst_chat, dst_thread, no_translate=bool(no_trans))
 
-        # --- FAN-OUT EXTRA ---
+        # Fan-out (rutas adicionales, con su propia regla de no-traducción)
         tid_norm = thread_id if thread_id is not None else 1
         extras = FANOUT_ROUTES.get((chat.id, tid_norm), [])
         for extra_chat, extra_thread in extras:
-            log.info("Fanout %s#%s → %s#%s | msg %s",
-                     chat.id, tid_norm, extra_chat, extra_thread, msg.message_id)
-            await replicate_message(context, msg, extra_chat, extra_thread)
+            extra_no_trans = _route_has_no_translate(chat.id, tid_norm, extra_chat, extra_thread)
+            log.info("Fanout %s#%s → %s#%s | msg %s | no_translate=%s",
+                     chat.id, tid_norm, extra_chat, extra_thread, msg.message_id, extra_no_trans)
+            await replicate_message(context, msg, extra_chat, extra_thread, no_translate=bool(extra_no_trans))
 
     except Exception as e:
         log.exception("Error on_group_post")

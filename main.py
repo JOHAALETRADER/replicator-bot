@@ -111,6 +111,15 @@ TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
     (G3, 2):     (G3, 4098, None),
 }
 
+# ================== FAN-OUT OPCIONAL (RUTAS ADICIONALES) ==================
+# Envía el mismo mensaje a destinos extra, además del destino principal de TOPIC_ROUTES.
+# Formato: (src_chat, src_thread) -> [(dst_chat, dst_thread), ...]
+FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
+    # G1: Resultados Alumnos y Retiros VIP → además a G3#2
+    (G1, 2890): [(G3, 2)],
+    (G1, 17373): [(G3, 2)],
+}
+
 # ================== HEURÍSTICA DE IDIOMA ==================
 _EN_COMMON = re.compile(r"\b(the|and|for|with|from|to|of|in|on|is|are|you|we|they|buy|sell|trade|signal|profit|setup|account)\b", re.I)
 _ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
@@ -145,6 +154,7 @@ def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str
         elif e.type in ("underline",): meta["tag"] = "u"
         elif e.type in ("strikethrough",): meta["tag"] = "s"
         elif e.type in ("code",): meta["tag"] = "code"
+        elif e.type in ("pre",): meta["tag"] = "pre"
         elif e.type == "text_link" and e.url:
             meta["tag"] = "a"; meta["href"] = e.url
         else:
@@ -513,6 +523,15 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dst_chat, dst_thread = route
         log.info("Group %s#%s → %s#%s | msg %s", chat.id, thread_id if thread_id is not None else 1, dst_chat, dst_thread, msg.message_id)
         await replicate_message(context, msg, dst_chat, dst_thread)
+
+        # --- FAN-OUT EXTRA ---
+        tid_norm = thread_id if thread_id is not None else 1
+        extras = FANOUT_ROUTES.get((chat.id, tid_norm), [])
+        for extra_chat, extra_thread in extras:
+            log.info("Fanout %s#%s → %s#%s | msg %s",
+                     chat.id, tid_norm, extra_chat, extra_thread, msg.message_id)
+            await replicate_message(context, msg, extra_chat, extra_thread)
+
     except Exception as e:
         log.exception("Error on_group_post")
         await alert_error(context, f"on_group_post: {e}")

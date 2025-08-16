@@ -108,27 +108,27 @@ TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
 
     # Grupo 3 (mismo grupo)
     (G3, 3):     (G3, 4096, None),
-    (G3, 2):     (G3, 4098, None),  # ES → EN dentro del mismo grupo
+    (G3, 2):     (G3, 4098, None),  # ES → EN dentro del mismo grupo (si el origen es directo)
 }
 
 # ================== FAN-OUT OPCIONAL ==================
 # (src_chat, src_thread) -> [(dst_chat, dst_thread), ...]
+# Para que desde G1#2890 y G1#17373 vaya:
+#   - a G3#2 SIN traducir (ES)
+#   - a G3#4098 TRADUCIDO (EN)
 FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
-    # De G1 (ES) también a G3#2 (ES)
-    (G1, 2890): [(G3, 2)],
-    (G1, 17373): [(G3, 2)],
+    (G1, 2890): [(G3, 2), (G3, 4098)],
+    (G1, 17373): [(G3, 2), (G3, 4098)],
 }
 
 # ================== OVERRIDE DE TRADUCCIÓN POR RUTA ==================
-# Para ciertas rutas queremos NO traducir (pasar ES tal cual).
-# Formato: set((src_chat, src_thread, dst_chat, dst_thread))
+# Rutas que NO deben traducirse (pasan ES tal cual)
 NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
-    # Lo nuevo: G1#2890 → G3#2 y G1#17373 → G3#2 deben llegar en ESPAÑOL sin traducir
+    # G1 → G3#2 en ES
     (G1, 2890, G3, 2),
     (G1, 17373, G3, 2),
 }
-# El resto usa el comportamiento global (TRANSLATE=True) y por tanto
-# G3#2 → G3#4098 saldrá en INGLÉS (como querías).
+# El resto usa la traducción global, por lo que G1→G3#4098 irá en EN.
 
 # ================== HEURÍSTICA DE IDIOMA ==================
 _EN_COMMON = re.compile(r"\b(the|and|for|with|from|to|of|in|on|is|are|you|we|they|buy|sell|trade|signal|profit|setup|account)\b", re.I)
@@ -309,7 +309,6 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
 
 # ================== TRADUCCIÓN VISIBLE (con override por ruta) ==================
 async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
-    # Traducción normal (global)
     frags = entities_to_html(text, entities or [])
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -324,7 +323,6 @@ async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tu
     return html_text, []
 
 def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
-    # Pasa el texto tal cual, solo aplicando formato y links
     return build_html(entities_to_html(text, entities or []))
 
 async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_translate: bool) -> Optional[InlineKeyboardMarkup]:
@@ -481,7 +479,6 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not dst:
             return
         log.info("Channel %s (id=%s) → %s | msg %s", msg.chat.username, msg.chat.id, dst, msg.message_id)
-        # Para canales mantenemos la traducción global
         await replicate_message(context, msg, dst, None, do_translate=True)
     except Exception as e:
         log.exception("Error on_channel_post")
@@ -507,7 +504,6 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         dst_chat, dst_thread = route
 
-        # ¿Esta ruta específica debe NO traducir?
         do_translate_main = not route_no_translate(chat.id, thread_id, dst_chat, dst_thread)
 
         log.info("Group %s#%s → %s#%s | translate=%s | msg %s",

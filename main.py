@@ -364,7 +364,9 @@ def map_channel(src_chat: Chat) -> Optional[int | str]:
     if ENV_SRC_ID is not None and src_id == ENV_SRC_ID:
         return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
     if ENV_SRC_UNAME and src_uname and src_uname == ENV_SRC_UNAME:
-        return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
+        return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME o
+
+r None)
 
     if src_id in CHANNEL_MAP:
         return CHANNEL_MAP[src_id]
@@ -423,6 +425,150 @@ async def alert_error(context: ContextTypes.DEFAULT_TYPE, text: str):
             pass
 
 # ================== REPLICACIÓN ==================
+
+def message_has_media(msg: Message) -> bool:
+    """Detecta si el mensaje contiene algún medio que podamos reenviar/enviar."""
+    return bool(
+        msg.photo or
+        msg.video or
+        msg.animation or
+        msg.document or
+        msg.audio or
+        msg.voice or
+        msg.video_note
+    )
+
+# --- ÁLBUMES (media_group) ---
+# Buffer por destino y grupo para juntar ítems y enviarlos como un solo álbum
+MEDIA_GROUP_BUFFER: Dict[Tuple[str, int, int, str, bool], Dict[str, Any]] = {}
+# key = (str(dest_chat_id), dest_thread_id or 0, src_chat_id, media_group_id, do_translate)
+
+def _dest_key(dest_chat_id: int | str) -> str:
+    return str(dest_chat_id)
+
+async def _get_caption_html(msg: Message, *, do_translate: bool) -> Optional[str]:
+    cap_text = msg.caption or ""
+    if not cap_text.strip():
+        return None
+    cap_entities = msg.caption_entities or []
+    if do_translate and TRANSLATE:
+        cap_html, _ = await translate_visible_html(cap_text, cap_entities)
+    else:
+        cap_html = build_html_no_translate(cap_text, cap_entities)
+    return cap_html
+
+def _media_to_inputmedia(msg: Message) -> Optional[Any]:
+    """Devuelve el InputMedia* correspondiente (sin caption) o None si no soportado por send_media_group."""
+    if msg.photo:
+        return InputMediaPhoto(media=msg.photo[-1].file_id)
+    if msg.video:
+        return InputMediaVideo(media=msg.video.file_id)
+    if msg.document:
+        return InputMediaDocument(media=msg.document.file_id)
+    if msg.audio:
+        return InputMediaAudio(media=msg.audio.file_id)
+    # Nota: animation/voice/video_note no están soportados en send_media_group.
+    return None
+
+async def queue_media_group_and_schedule_flush(context: ContextTypes.DEFAULT_TYPE,
+                                               src_msg: Message,
+                                               dest_chat_id: int | str,
+                                               dest_thread_id: Optional[int],
+                                               *, do_translate: bool):
+    mgid = src_msg.media_group_id
+    if not mgid:
+        # por seguridad; si no hay media_group_id, enviamos como media suelto
+        await send_media(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
+        return
+
+    key = (_dest_key(dest_chat_id), int(dest_thread_id or 0), int(src_msg.chat.id), str(mgid), bool(do_translate))
+    bucket = MEDIA_GROUP_BUFFER.get(key)
+    if bucket is None:
+        bucket = {
+            "items": [],        # lista de InputMedia*
+            "caption": None,    # caption ya preparado (html) para el primer item
+            "job": None,
+        }
+        MEDIA_GROUP_BUFFER[key] = bucket
+
+    # Convertimos este mensaje a InputMedia
+    im = _media_to_inputmedia(src_msg)
+    if im is None:
+        # Si no es soportado para álbum, envíalo individual
+        await send_media(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
+        return
+
+    # Si aún no hay caption y este mensaje trae caption, la guardamos para el primero
+    if bucket["caption"] is None:
+        bucket["caption"] = await _get_caption_html(src_msg, do_translate=do_translate)
+
+    bucket["items"].append(im)
+
+    # Reprogramamos/Programamos flush en ~1.2s
+    async def _flush_album(ctx: ContextTypes.DEFAULT_TYPE):
+        b = MEDIA_GROUP_BUFFER.pop(key, None)
+        if not b or not b["items"]:
+            return
+        media_list = b["items"]
+        # Ponemos caption en el primer elemento (si existe)
+        if b["caption"]:
+            media_list[0].caption = b["caption"]
+            media_list[0].parse_mode = ParseMode.HTML
+
+        try:
+            await ctx.bot.send_media_group(
+                chat_id=dest_chat_id,
+                message_thread_id=dest_thread_id,
+                media=media_list,
+            )
+        except Exception as e:
+            log.warning("send_media_group failed (%s). Fallback individual. Error: %s", key, e)
+            # Fallback: enviar cada item suelto sin agrupar (caption solo en el primero)
+            for i, im_item in enumerate(media_list):
+                try:
+                    if isinstance(im_item, InputMediaPhoto):
+                        await ctx.bot.send_photo(
+                            chat_id=dest_chat_id,
+                            message_thread_id=dest_thread_id,
+                            photo=im_item.media,
+                            caption=im_item.caption if i == 0 else None,
+                            parse_mode=ParseMode.HTML if (i == 0 and im_item.caption) else None,
+                        )
+                    elif isinstance(im_item, InputMediaVideo):
+                        await ctx.bot.send_video(
+                            chat_id=dest_chat_id,
+                            message_thread_id=dest_thread_id,
+                            video=im_item.media,
+                            caption=im_item.caption if i == 0 else None,
+                            parse_mode=ParseMode.HTML if (i == 0 and im_item.caption) else None,
+                        )
+                    elif isinstance(im_item, InputMediaDocument):
+                        await ctx.bot.send_document(
+                            chat_id=dest_chat_id,
+                            message_thread_id=dest_thread_id,
+                            document=im_item.media,
+                            caption=im_item.caption if i == 0 else None,
+                            parse_mode=ParseMode.HTML if (i == 0 and im_item.caption) else None,
+                        )
+                    elif isinstance(im_item, InputMediaAudio):
+                        await ctx.bot.send_audio(
+                            chat_id=dest_chat_id,
+                            message_thread_id=dest_thread_id,
+                            audio=im_item.media,
+                            caption=im_item.caption if i == 0 else None,
+                            parse_mode=ParseMode.HTML if (i == 0 and im_item.caption) else None,
+                        )
+                except Exception as e2:
+                    log.warning("Fallback media item failed: %s", e2)
+
+    # Cancela cualquier flush anterior y crea uno nuevo
+    if bucket["job"] is not None:
+        try:
+            bucket["job"].schedule_removal()
+        except Exception:
+            pass
+    bucket["job"] = context.job_queue.run_once(lambda j: _flush_album(context), when=1.2)
+
 async def send_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int],
                     msg: Message, *, do_translate: bool):
     if do_translate and TRANSLATE:
@@ -466,12 +612,127 @@ async def copy_with_caption(context: ContextTypes.DEFAULT_TYPE, chat_id: int | s
             message_id=msg.message_id,
         )
 
+async def send_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, thread_id: Optional[int],
+                     msg: Message, *, do_translate: bool):
+    """
+    Envía medios (photo/video/animation/document/audio/voice) con caption opcional,
+    aplicando traducción y botones según corresponda.
+    """
+    cap_text = msg.caption or ""
+    cap_entities = msg.caption_entities or []
+    if cap_text.strip():
+        if do_translate and TRANSLATE:
+            caption_html, _ = await translate_visible_html(cap_text, cap_entities)
+        else:
+            caption_html = build_html_no_translate(cap_text, cap_entities)
+    else:
+        caption_html = None
+
+    kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
+
+    try:
+        if msg.photo:
+            file_id = msg.photo[-1].file_id  # mejor calidad
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                photo=file_id,
+                caption=caption_html,
+                parse_mode=ParseMode.HTML if caption_html else None,
+                reply_markup=kb,
+            )
+            return
+
+        if msg.video:
+            await context.bot.send_video(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                video=msg.video.file_id,
+                caption=caption_html,
+                parse_mode=ParseMode.HTML if caption_html else None,
+                reply_markup=kb,
+            )
+            return
+
+        if msg.animation:
+            await context.bot.send_animation(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                animation=msg.animation.file_id,
+                caption=caption_html,
+                parse_mode=ParseMode.HTML if caption_html else None,
+                reply_markup=kb,
+            )
+            return
+
+        if msg.document:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                document=msg.document.file_id,
+                caption=caption_html,
+                parse_mode=ParseMode.HTML if caption_html else None,
+                reply_markup=kb,
+            )
+            return
+
+        if msg.audio:
+            await context.bot.send_audio(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                audio=msg.audio.file_id,
+                caption=caption_html,
+                parse_mode=ParseMode.HTML if caption_html else None,
+                reply_markup=kb,
+            )
+            return
+
+        if msg.voice:
+            await context.bot.send_voice(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                voice=msg.voice.file_id,
+                caption=caption_html,
+                parse_mode=ParseMode.HTML if caption_html else None,
+                reply_markup=kb,
+            )
+            return
+
+        if msg.video_note:
+            await context.bot.send_video_note(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                video_note=msg.video_note.file_id,
+                reply_markup=kb,
+            )
+            return
+
+        # Si llegamos aquí, no detectamos medio soportado -> fallback
+        await copy_with_caption(context, chat_id, thread_id, msg, do_translate=do_translate)
+
+    except Exception as e:
+        log.warning("send_media failed, fallback to copy_message: %s", e)
+        await copy_with_caption(context, chat_id, thread_id, msg, do_translate=do_translate)
+
 async def replicate_message(context: ContextTypes.DEFAULT_TYPE, src_msg: Message,
                             dest_chat_id: int | str, dest_thread_id: Optional[int],
                             *, do_translate: bool):
+    # 1) Texto puro
     if src_msg.text:
         await send_text(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
         return
+
+    # 2) Álbum (media_group)
+    if src_msg.media_group_id and (_media_to_inputmedia(src_msg) is not None):
+        await queue_media_group_and_schedule_flush(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+        return
+
+    # 3) Medio suelto
+    if message_has_media(src_msg):
+        await send_media(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
+        return
+
+    # 4) Resto (stickers u otros) -> copy
     await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
 
 # ================== COMANDOS DE EDICIÓN (NUEVO) ==================
@@ -525,65 +786,6 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e2:
             log.warning("edit failed text=%s caption=%s", e1, e2)
             await update.effective_message.reply_text("⚠️ No se pudo editar. Verifica el ID y que el mensaje sea del bot.")
-
-async def cmd_editmedia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ /editmedia <message_id>  -> luego envías el NUEVO medio """
-    user = update.effective_user
-    if not _is_admin(user.id):
-        return
-    if not context.args or len(context.args) < 1:
-        await update.effective_message.reply_text("Uso: /editmedia <message_id>\nDespués envía la nueva foto/video/documento/audio (con caption opcional).")
-        return
-    try:
-        msg_id = int(context.args[0])
-    except Exception:
-        await update.effective_message.reply_text("message_id inválido.")
-        return
-
-    PENDING_MEDIA[user.id] = {"chat_id": update.effective_chat.id, "message_id": msg_id}
-    await update.effective_message.reply_text("👌 Ahora envíame el nuevo medio (foto/video/documento/audio). Si deseas, incluye un caption (HTML permitido).")
-
-async def on_admin_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ Reemplaza el medio del mensaje pendiente (/editmedia) """
-    user = update.effective_user
-    if not _is_admin(user.id):
-        return
-    pend = PENDING_MEDIA.get(user.id)
-    if not pend:
-        return  # no hay edición pendiente
-    chat_id = pend["chat_id"]
-    msg_id = pend["message_id"]
-
-    msg = update.effective_message
-    caption = msg.caption or None
-    parse_mode = ParseMode.HTML if caption else None
-
-    media = None
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
-        media = InputMediaPhoto(media=file_id, caption=caption, parse_mode=parse_mode)
-    elif msg.video:
-        media = InputMediaVideo(media=msg.video.file_id, caption=caption, parse_mode=parse_mode)
-    elif msg.document:
-        media = InputMediaDocument(media=msg.document.file_id, caption=caption, parse_mode=parse_mode)
-    elif msg.audio:
-        media = InputMediaAudio(media=msg.audio.file_id, caption=caption, parse_mode=parse_mode)
-
-    if not media:
-        await msg.reply_text("⚠️ Debes enviar foto/video/documento/audio para reemplazar.")
-        return
-
-    try:
-        await context.bot.edit_message_media(
-            chat_id=chat_id,
-            message_id=msg_id,
-            media=media,
-        )
-        await msg.reply_text("✅ Medio reemplazado.")
-        PENDING_MEDIA.pop(user.id, None)
-    except Exception as e:
-        log.warning("edit media failed: %s", e)
-        await msg.reply_text("⚠️ No se pudo reemplazar el medio. Verifica el ID y que el mensaje sea del bot.")
 
 # ================== HANDLERS ==================
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -650,15 +852,10 @@ def main():
     ensure_env()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Comandos de edición (nuevo)
-    app.add_handler(CommandHandler("edit", cmd_edit, filters=filters.ChatType.GROUPS | filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("editmedia", cmd_editmedia, filters=filters.ChatType.GROUPS | filters.ChatType.PRIVATE))
-    app.add_handler(MessageHandler(
-        (filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO),
-        on_admin_media_upload
-    ))
+    # Comandos de edición
+    app.add_handler(CommandHandler("edit", cmd_edit, filters=filters.ChatType.GROUPS | filters.ChatType.CHANNEL))
 
-    # Replicadores existentes
+    # Handlers de posts
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_post))
 
@@ -667,4 +864,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

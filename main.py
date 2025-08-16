@@ -27,7 +27,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # Traducción (global por defecto)
 TRANSLATE = os.getenv("TRANSLATE", "true").lower() == "true"
 TRANSLATOR = "deepl"
-DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "384e6eb2-922a-43ce-8e8f-7cd3ac0047b7").strip()
+import os
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "").strip()
 DEEPL_API_HOST = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()
 
 SOURCE_LANG = os.getenv("SOURCE_LANG", "ES").upper()

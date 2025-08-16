@@ -12,12 +12,17 @@ from telegram import (
     Message,
     MessageEntity,
     Chat,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+    InputMediaAudio,
 )
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     ContextTypes,
     MessageHandler,
+    CommandHandler,
     filters,
 )
 
@@ -27,7 +32,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # Traducción (global por defecto)
 TRANSLATE = os.getenv("TRANSLATE", "true").lower() == "true"
 TRANSLATOR = "deepl"
-import os
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "").strip()
 DEEPL_API_HOST = os.getenv("DEEPL_API_HOST", "api-free.deepl.com").strip()
 
@@ -470,6 +474,117 @@ async def replicate_message(context: ContextTypes.DEFAULT_TYPE, src_msg: Message
         return
     await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
 
+# ================== COMANDOS DE EDICIÓN (NUEVO) ==================
+ADMIN_SET = {ADMIN_ID, ANON_ADMIN_ID}
+PENDING_MEDIA: Dict[int, Dict[str, Any]] = {}  # por usuario: {"chat_id":..., "message_id":...}
+
+def _is_admin(uid: Optional[int]) -> bool:
+    return bool(uid) and (uid in ADMIN_SET)
+
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ /edit <message_id> <texto nuevo>  -> edita texto o caption """
+    user = update.effective_user
+    if not _is_admin(user.id):
+        return
+    if not context.args or len(context.args) < 2:
+        await update.effective_message.reply_text("Uso: /edit <message_id> <texto nuevo>")
+        return
+    try:
+        msg_id = int(context.args[0])
+    except Exception:
+        await update.effective_message.reply_text("message_id inválido.")
+        return
+    new_text = " ".join(context.args[1:]).strip()
+    if not new_text:
+        await update.effective_message.reply_text("El texto no puede estar vacío.")
+        return
+
+    chat_id = update.effective_chat.id
+    try:
+        # intentamos como texto
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=new_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        await update.effective_message.reply_text("✅ Texto editado.")
+        return
+    except Exception as e1:
+        try:
+            # si era media con caption
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=msg_id,
+                caption=new_text,
+                parse_mode=ParseMode.HTML,
+            )
+            await update.effective_message.reply_text("✅ Caption editado.")
+            return
+        except Exception as e2:
+            log.warning("edit failed text=%s caption=%s", e1, e2)
+            await update.effective_message.reply_text("⚠️ No se pudo editar. Verifica el ID y que el mensaje sea del bot.")
+
+async def cmd_editmedia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ /editmedia <message_id>  -> luego envías el NUEVO medio """
+    user = update.effective_user
+    if not _is_admin(user.id):
+        return
+    if not context.args or len(context.args) < 1:
+        await update.effective_message.reply_text("Uso: /editmedia <message_id>\nDespués envía la nueva foto/video/documento/audio (con caption opcional).")
+        return
+    try:
+        msg_id = int(context.args[0])
+    except Exception:
+        await update.effective_message.reply_text("message_id inválido.")
+        return
+
+    PENDING_MEDIA[user.id] = {"chat_id": update.effective_chat.id, "message_id": msg_id}
+    await update.effective_message.reply_text("👌 Ahora envíame el nuevo medio (foto/video/documento/audio). Si deseas, incluye un caption (HTML permitido).")
+
+async def on_admin_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ Reemplaza el medio del mensaje pendiente (/editmedia) """
+    user = update.effective_user
+    if not _is_admin(user.id):
+        return
+    pend = PENDING_MEDIA.get(user.id)
+    if not pend:
+        return  # no hay edición pendiente
+    chat_id = pend["chat_id"]
+    msg_id = pend["message_id"]
+
+    msg = update.effective_message
+    caption = msg.caption or None
+    parse_mode = ParseMode.HTML if caption else None
+
+    media = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        media = InputMediaPhoto(media=file_id, caption=caption, parse_mode=parse_mode)
+    elif msg.video:
+        media = InputMediaVideo(media=msg.video.file_id, caption=caption, parse_mode=parse_mode)
+    elif msg.document:
+        media = InputMediaDocument(media=msg.document.file_id, caption=caption, parse_mode=parse_mode)
+    elif msg.audio:
+        media = InputMediaAudio(media=msg.audio.file_id, caption=caption, parse_mode=parse_mode)
+
+    if not media:
+        await msg.reply_text("⚠️ Debes enviar foto/video/documento/audio para reemplazar.")
+        return
+
+    try:
+        await context.bot.edit_message_media(
+            chat_id=chat_id,
+            message_id=msg_id,
+            media=media,
+        )
+        await msg.reply_text("✅ Medio reemplazado.")
+        PENDING_MEDIA.pop(user.id, None)
+    except Exception as e:
+        log.warning("edit media failed: %s", e)
+        await msg.reply_text("⚠️ No se pudo reemplazar el medio. Verifica el ID y que el mensaje sea del bot.")
+
 # ================== HANDLERS ==================
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -534,10 +649,22 @@ def ensure_env():
 def main():
     ensure_env()
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Comandos de edición (nuevo)
+    app.add_handler(CommandHandler("edit", cmd_edit, filters=filters.ChatType.GROUPS | filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("editmedia", cmd_editmedia, filters=filters.ChatType.GROUPS | filters.ChatType.PRIVATE))
+    app.add_handler(MessageHandler(
+        (filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO),
+        on_admin_media_upload
+    ))
+
+    # Replicadores existentes
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_post))
+
     log.info("Replicator iniciado. Translate=%s, Buttons=%s | ENV_SRC=%s ENV_DST=%s", TRANSLATE, TRANSLATE_BUTTONS, ENV_SRC, ENV_DST)
     app.run_polling(allowed_updates=["channel_post", "message"], poll_interval=1.2, stop_signals=None)
 
 if __name__ == "__main__":
     main()
+

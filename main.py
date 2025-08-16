@@ -83,7 +83,7 @@ G2 = -1002131156976
 G5 = -1002569975479
 G3 = -1002127373425
 
-# ← NUEVO: tu ID real para el Chat
+# ← Tu ID para filtrar el Chat
 CHAT_OWNER_ID = 5958164558
 
 # (src_chat, src_thread) -> (dst_chat, dst_thread, only_sender_id | None)
@@ -393,11 +393,11 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
     """
     Mapea (chat, thread) → (chat, thread). Reglas:
       1) Coincidencia exacta en TOPIC_ROUTES.
-      2) Si thread_id es None/0, normaliza a 1.
-      3) Fallback para el Chat del Grupo 1: si el mensaje es tuyo o Telegram
-         no manda from_user (sender_id=None), envía a G4#10.
+      2) Si thread_id es None/0, normaliza a 1 y vuelve a buscar.
+      3) Fallback para el Chat del Grupo 1 (General): si el mensaje es tuyo
+         o Telegram no manda from_user (sender_id=None), envía a G4#10.
     """
-    # 1) exacto
+    # 1) exacto primero
     if src_thread_id is not None:
         route = TOPIC_ROUTES.get((src_chat_id, src_thread_id))
         if route:
@@ -415,7 +415,7 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
             return None
         return (dst_chat, dst_thread)
 
-    # 3) fallback seguro para Chat del G1
+    # 3) fallback específico para CHAT del Grupo 1
     if src_chat_id == G1 and (src_thread_id in (None, 0, 1)):
         if sender_id is None or sender_id == CHAT_OWNER_ID:
             return (G4, 10)
@@ -494,8 +494,14 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
             return
+
         thread_id = msg.message_thread_id
         sender_id = msg.from_user.id if msg.from_user else None
+
+        # DEBUG extra para el CHAT del Grupo 1
+        if chat.id == G1:
+            logging.info(f"[CHAT DEBUG] thread_id={thread_id} sender={sender_id}")
+
         route = map_topic(chat.id, thread_id, sender_id)
         if not route:
             return

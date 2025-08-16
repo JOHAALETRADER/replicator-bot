@@ -85,12 +85,14 @@ G3 = -1002127373425
 
 # ← Tu ID para filtrar el Chat
 CHAT_OWNER_ID = 5958164558
+# ← NUEVO: ID del “Anonymous Admin” de Telegram
+ANON_ADMIN_ID = 1087968824
 
 # (src_chat, src_thread) -> (dst_chat, dst_thread, only_sender_id | None)
 TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
     # Grupo 1 → Grupo 4
     (G1, 129):   (G4, 8,   None),
-    (G1, 1):     (G4, 10,  CHAT_OWNER_ID),   # Chat → Chat Room (solo tú)
+    (G1, 1):     (G4, 10,  CHAT_OWNER_ID),   # Chat → Chat Room (solo tú; con excepción para Anonymous Admin más abajo)
     (G1, 2890):  (G4, 6,   None),
     (G1, 17373): (G4, 6,   None),
     (G1, 8):     (G4, 2,   None),
@@ -143,7 +145,6 @@ def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str
         elif e.type in ("underline",): meta["tag"] = "u"
         elif e.type in ("strikethrough",): meta["tag"] = "s"
         elif e.type in ("code",): meta["tag"] = "code"
-        elif e.type in ("pre",): meta["tag"] = "pre"
         elif e.type == "text_link" and e.url:
             meta["tag"] = "a"; meta["href"] = e.url
         else:
@@ -321,7 +322,6 @@ def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str
         elif e.type in ("underline",): meta["tag"] = "u"
         elif e.type in ("strikethrough",): meta["tag"] = "s"
         elif e.type in ("code",): meta["tag"] = "code"
-        elif e.type in ("pre",): meta["tag"] = "pre"
         elif e.type == "text_link" and e.url:
             meta["tag"] = "a"; meta["href"] = e.url
         else:
@@ -394,15 +394,21 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
     Mapea (chat, thread) → (chat, thread). Reglas:
       1) Coincidencia exacta en TOPIC_ROUTES.
       2) Si thread_id es None/0, normaliza a 1 y vuelve a buscar.
-      3) Fallback para el Chat del Grupo 1 (General): si el mensaje es tuyo
-         o Telegram no manda from_user (sender_id=None), envía a G4#10.
+      3) Excepción para el CHAT del Grupo 1: si only_sender=CHAT_OWNER_ID
+         y el remitente es el Anonymous Admin (1087968824), también permite replicar.
     """
     # 1) exacto primero
     if src_thread_id is not None:
         route = TOPIC_ROUTES.get((src_chat_id, src_thread_id))
         if route:
             dst_chat, dst_thread, only_sender = route
-            if only_sender and sender_id and sender_id != only_sender:
+            if only_sender:
+                # Permitir si es el owner normal...
+                if sender_id == only_sender:
+                    return (dst_chat, dst_thread)
+                # ...o si es el Anonymous Admin en el Chat del G1
+                if (src_chat_id == G1 and src_thread_id in (None, 0, 1) and sender_id == ANON_ADMIN_ID):
+                    return (dst_chat, dst_thread)
                 return None
             return (dst_chat, dst_thread)
 
@@ -411,14 +417,13 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
     route = TOPIC_ROUTES.get((src_chat_id, tid))
     if route:
         dst_chat, dst_thread, only_sender = route
-        if only_sender and sender_id and sender_id != only_sender:
+        if only_sender:
+            if sender_id == only_sender:
+                return (dst_chat, dst_thread)
+            if (src_chat_id == G1 and tid == 1 and sender_id == ANON_ADMIN_ID):
+                return (dst_chat, dst_thread)
             return None
         return (dst_chat, dst_thread)
-
-    # 3) fallback específico para CHAT del Grupo 1
-    if src_chat_id == G1 and (src_thread_id in (None, 0, 1)):
-        if sender_id is None or sender_id == CHAT_OWNER_ID:
-            return (G4, 10)
 
     return None
 

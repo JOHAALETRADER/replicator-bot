@@ -364,9 +364,7 @@ def map_channel(src_chat: Chat) -> Optional[int | str]:
     if ENV_SRC_ID is not None and src_id == ENV_SRC_ID:
         return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
     if ENV_SRC_UNAME and src_uname and src_uname == ENV_SRC_UNAME:
-        return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME o
-
-r None)
+        return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
 
     if src_id in CHANNEL_MAP:
         return CHANNEL_MAP[src_id]

@@ -468,8 +468,9 @@ async def copy_with_caption(context: ContextTypes.DEFAULT_TYPE, chat_id: int | s
         )
 
 # --------- SOPORTE DE ÁLBUM (media_group) ---------
-MEDIA_GROUP_BUFFER: Dict[Tuple[int, str, int, Optional[int], bool], List[Message]] = {}
-MEDIA_GROUP_TASKS: Dict[Tuple[int, str, int, Optional[int], bool], Any] = {}
+# FIX: permitir str o int en dest_chat dentro de la clave
+MEDIA_GROUP_BUFFER: Dict[Tuple[int, str, Any, Optional[int], bool], List[Message]] = {}
+MEDIA_GROUP_TASKS: Dict[Tuple[int, str, Any, Optional[int], bool], Any] = {}
 MEDIA_GROUP_DELAY = 0.6  # segundos
 
 def _msg_has_photo(msg: Message) -> bool:
@@ -496,7 +497,7 @@ def _msg_build_input_media(msg: Message, *, caption_html: Optional[str]) -> Opti
         return InputMediaAudio(media=msg.audio.file_id, caption=caption_html, parse_mode=ParseMode.HTML if caption_html else None)
     return None
 
-async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE, key: Tuple[int, str, int, Optional[int], bool]):
+async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE, key: Tuple[int, str, Any, Optional[int], bool]):
     try:
         msgs = MEDIA_GROUP_BUFFER.pop(key, [])
         MEDIA_GROUP_TASKS.pop(key, None)
@@ -555,7 +556,8 @@ async def replicate_media_with_album_support(context: ContextTypes.DEFAULT_TYPE,
         await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
         return
 
-    key = (src_msg.chat.id, str(mgid), int(dest_chat_id), dest_thread_id, bool(do_translate))
+    # FIX: no castear dest_chat_id a int; usar tal cual (str o int)
+    key = (src_msg.chat.id, str(mgid), dest_chat_id, dest_thread_id, bool(do_translate))
     bucket = MEDIA_GROUP_BUFFER.setdefault(key, [])
     bucket.append(src_msg)
 

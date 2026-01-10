@@ -3,6 +3,8 @@ import html
 import logging
 import re
 import asyncio
+import sqlite3
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Callable, Awaitable
 
 import aiohttp
@@ -87,13 +89,13 @@ ENV_SRC_UNAME, ENV_SRC_ID = _norm_chan(ENV_SRC)
 ENV_DST_UNAME, ENV_DST_ID = _norm_chan(ENV_DST)
 
 # ================== GRUPOS / TEMAS ==================
-G1 = -1001946870620
-G4 = -1002725606859
+G1 = -1001946870620  # origen ES (tu link /c/1946870620)
+G4 = -1002725606859  # espejo EN (tu link /c/2725606859)
 G2 = -1002131156976
 G5 = -1002569975479
 G3 = -1002127373425
 
-# ← Tu ID para filtrar el Chat
+# ← Tu ID (ya NO se usa para filtrar Chat ES→EN)
 CHAT_OWNER_ID = 5958164558
 # ← ID del “Anonymous Admin” de Telegram
 ANON_ADMIN_ID = 1087968824
@@ -102,7 +104,7 @@ ANON_ADMIN_ID = 1087968824
 TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
     # Grupo 1 → Grupo 4
     (G1, 129): (G4, 8, None),
-    (G1, 1): (G4, 10, CHAT_OWNER_ID),  # Chat → Chat Room (solo tú; excepción para Anonymous Admin más abajo)
+    (G1, 1): (G4, 10, None),  # ✅ Chat → Chat Room (replica TODOS)
     (G1, 2890): (G4, 6, None),
     (G1, 17373): (G4, 6, None),
     (G1, 8): (G4, 2, None),
@@ -134,8 +136,44 @@ NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
     (G1, 17373, G3, 2),
 }
 
+# ================== ANTI-LOOP: NO replicar desde destinos ==================
+DEST_TOPIC_SET: set[Tuple[int, int]] = set()
+for (_src_chat, _src_thread), (_dst_chat, _dst_thread, _only_sender) in TOPIC_ROUTES.items():
+    DEST_TOPIC_SET.add((_dst_chat, _dst_thread))
+
+def is_destination_topic(chat_id: int, thread_id: Optional[int]) -> bool:
+    tid = 1 if (thread_id in (None, 0)) else thread_id
+    return (chat_id, tid) in DEST_TOPIC_SET
+
+
+# ================== DEDUP: evita procesar el mismo msg varias veces ==================
+DEDUP_TTL_SECONDS = float(os.getenv("DEDUP_TTL_SECONDS", "120") or "120")
+_seen_msgs: Dict[Tuple[int, int], float] = {}
+
+def seen_recent(chat_id: int, message_id: int) -> bool:
+    now = asyncio.get_event_loop().time()
+    key = (int(chat_id), int(message_id))
+
+    # limpieza ocasional
+    if len(_seen_msgs) > 2000:
+        cutoff = now - DEDUP_TTL_SECONDS
+        for k in list(_seen_msgs.keys()):
+            if _seen_msgs.get(k, 0) < cutoff:
+                _seen_msgs.pop(k, None)
+
+    t = _seen_msgs.get(key)
+    if t and (now - t) < DEDUP_TTL_SECONDS:
+        return True
+
+    _seen_msgs[key] = now
+    return False
+
+
 # ================== HEURÍSTICA DE IDIOMA ==================
-_EN_COMMON = re.compile(r"\b(the|and|for|with|from|to|of|in|on|is|are|you|we|they|buy|sell|trade|signal|profit|setup|account)\b", re.I)
+_EN_COMMON = re.compile(
+    r"\b(the|and|for|with|from|to|of|in|on|is|are|you|we|they|buy|sell|trade|signal|profit|setup|account)\b",
+    re.I
+)
 _ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
 
 
@@ -239,7 +277,7 @@ pullback\tpullback
 order block\torder block
 liquidity\tliquidity
 spread\tspread
-hedging\thedging
+hedging\thedding
 derivatives\tderivatives
 leverage\tleverage
 support\tsupport
@@ -299,6 +337,7 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         return text
     if not TRANSLATE or not DEEPL_API_KEY:
         return text
+    # ✅ opción A: si ya es inglés y no forzamos, se deja tal cual
     if not FORCE_TRANSLATE and probably_english(text):
         return text
 
@@ -330,7 +369,7 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         return js["translations"][0]["text"]
 
 
-# ================== TRADUCCIÓN VISIBLE (con override por ruta) ==================
+# ================== TRADUCCIÓN VISIBLE ==================
 async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
     frags = entities_to_html(text, entities or [])
     timeout = aiohttp.ClientTimeout(total=45)
@@ -377,6 +416,85 @@ async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_transl
         return InlineKeyboardMarkup(rows)
 
 
+# ================== MAPEO DE REPLY/EDITS (SQLite persistente) ==================
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+DB_PATH = Path(os.getenv("REPL_DB_PATH", str(DATA_DIR / "replicator_map.db")))
+
+_DB_CONN: Optional[sqlite3.Connection] = None
+
+
+def db_init():
+    global _DB_CONN
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _DB_CONN = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    _DB_CONN.execute("""
+        CREATE TABLE IF NOT EXISTS msg_map (
+            src_chat INTEGER NOT NULL,
+            src_msg  INTEGER NOT NULL,
+            dst_chat INTEGER NOT NULL,
+            dst_msg  INTEGER NOT NULL,
+            PRIMARY KEY (src_chat, src_msg, dst_chat)
+        )
+    """)
+    _DB_CONN.execute("CREATE INDEX IF NOT EXISTS idx_src ON msg_map (src_chat, src_msg)")
+    _DB_CONN.commit()
+
+
+def db_save_map(src_chat: int, src_msg: int, dst_chat: int, dst_msg: int):
+    if not _DB_CONN:
+        db_init()
+    try:
+        _DB_CONN.execute(
+            "INSERT OR REPLACE INTO msg_map (src_chat, src_msg, dst_chat, dst_msg) VALUES (?, ?, ?, ?)",
+            (int(src_chat), int(src_msg), int(dst_chat), int(dst_msg))
+        )
+        _DB_CONN.commit()
+    except Exception as e:
+        log.warning("db_save_map failed: %s", e)
+
+
+def db_get_dst_msg(src_chat: int, src_msg: int, dst_chat: int) -> Optional[int]:
+    if not _DB_CONN:
+        db_init()
+    try:
+        cur = _DB_CONN.execute(
+            "SELECT dst_msg FROM msg_map WHERE src_chat=? AND src_msg=? AND dst_chat=? LIMIT 1",
+            (int(src_chat), int(src_msg), int(dst_chat))
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+# ================== PREFIJO "👤 Nombre:" ==================
+def sender_display_name(msg: Message) -> str:
+    # Anonymous admin / sender_chat
+    if getattr(msg, "sender_chat", None):
+        try:
+            return (msg.sender_chat.title or "Anonymous").strip()
+        except Exception:
+            return "Anonymous"
+    if msg.from_user:
+        try:
+            return (msg.from_user.full_name or msg.from_user.first_name or "Usuario").strip()
+        except Exception:
+            return "Usuario"
+    return "Usuario"
+
+
+def prefix_block(name: str) -> str:
+    name = (name or "Usuario").strip()
+    return f"👤 Nombre: {name}\n\n"
+
+
+def cap_with_prefix(prefix: str, cap_html: str, max_len: int = 1024) -> str:
+    out = (prefix + cap_html).strip()
+    if len(out) <= max_len:
+        return out
+    return out[: max_len - 1] + "…"
+
+
 # ================== MAPEO ==================
 def map_channel(src_chat: Chat) -> Optional[int | str]:
     src_id = int(src_chat.id)
@@ -402,10 +520,7 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
     Mapea (chat, thread) → (chat, thread). Reglas:
       1) Coincidencia exacta en TOPIC_ROUTES.
       2) Si thread_id es None/0, normaliza a 1 y vuelve a buscar.
-      3) Excepción para el CHAT del Grupo 1: si only_sender=CHAT_OWNER_ID
-         y el remitente es el Anonymous Admin (1087968824), también permite replicar.
     """
-    # 1) exacto primero
     if src_thread_id is not None:
         route = TOPIC_ROUTES.get((src_chat_id, src_thread_id))
         if route:
@@ -413,20 +528,15 @@ def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optiona
             if only_sender:
                 if sender_id == only_sender:
                     return (dst_chat, dst_thread)
-                if (src_chat_id == G1 and src_thread_id in (None, 0, 1) and sender_id == ANON_ADMIN_ID):
-                    return (dst_chat, dst_thread)
                 return None
             return (dst_chat, dst_thread)
 
-    # 2) normalización General→1
     tid = 1 if (src_thread_id in (None, 0)) else src_thread_id
     route = TOPIC_ROUTES.get((src_chat_id, tid))
     if route:
         dst_chat, dst_thread, only_sender = route
         if only_sender:
             if sender_id == only_sender:
-                return (dst_chat, dst_thread)
-            if (src_chat_id == G1 and tid == 1 and sender_id == ANON_ADMIN_ID):
                 return (dst_chat, dst_thread)
             return None
         return (dst_chat, dst_thread)
@@ -455,11 +565,6 @@ async def call_with_retry(
     tries: int = 4,
     base_delay: float = 1.2,
 ):
-    """
-    FIX PRINCIPAL:
-    - Si Telegram/Red tiene picos (TimedOut/NetworkError/429), antes fallaba y se cortaba la replicación.
-    - Ahora reintentamos, y si una ruta falla, NO bloquea el resto de rutas (fanout).
-    """
     last_exc: Exception | None = None
     for i in range(1, tries + 1):
         try:
@@ -475,7 +580,6 @@ async def call_with_retry(
             log.warning("[%s] Timeout/NetworkError (intento %s/%s). Esperando %.1fs. Err=%s", label, i, tries, wait, e)
             await asyncio.sleep(wait)
         except BadRequest as e:
-            # Error lógico (thread inválido, etc.). Lo levantamos para que quede visible en logs/alerta.
             log.error("[%s] BadRequest: %s", label, e)
             raise
         except Forbidden as e:
@@ -491,6 +595,26 @@ async def call_with_retry(
         raise last_exc
 
 
+# ================== HELPERS REPLY/LOOP ==================
+def is_from_bot(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        if msg.from_user and context.bot and msg.from_user.id == context.bot.id:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def resolve_reply_to_id(src_msg: Message, dst_chat: int) -> Optional[int]:
+    try:
+        r = getattr(src_msg, "reply_to_message", None)
+        if not r:
+            return None
+        return db_get_dst_msg(src_msg.chat.id, r.message_id, dst_chat)
+    except Exception:
+        return None
+
+
 # ================== REPLICACIÓN ==================
 async def send_text(
     context: ContextTypes.DEFAULT_TYPE,
@@ -499,14 +623,20 @@ async def send_text(
     msg: Message,
     *,
     do_translate: bool,
-):
+    reply_to_message_id: Optional[int] = None,
+) -> Optional[Message]:
+    name = sender_display_name(msg)
+    pref = prefix_block(name)
+
     if do_translate and TRANSLATE:
         html_text, _ = await translate_visible_html(msg.text or "", msg.entities or [])
     else:
         html_text = build_html_no_translate(msg.text or "", msg.entities or [])
+
+    html_text = pref + html_text
     kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
 
-    await call_with_retry(
+    sent = await call_with_retry(
         "send_message",
         lambda: context.bot.send_message(
             chat_id=chat_id,
@@ -515,8 +645,10 @@ async def send_text(
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=kb,
+            reply_to_message_id=reply_to_message_id,
         ),
     )
+    return sent
 
 
 async def copy_with_caption(
@@ -526,16 +658,24 @@ async def copy_with_caption(
     msg: Message,
     *,
     do_translate: bool,
-):
+    reply_to_message_id: Optional[int] = None,
+) -> Optional[Message]:
+    name = sender_display_name(msg)
+    pref = prefix_block(name)
+
     cap_text = msg.caption or ""
     cap_entities = msg.caption_entities or []
+
     if cap_text.strip():
         if do_translate and TRANSLATE:
             cap_html, _ = await translate_visible_html(cap_text, cap_entities)
         else:
             cap_html = build_html_no_translate(cap_text, cap_entities)
+
+        cap_html = cap_with_prefix(pref, cap_html, max_len=1024)
         kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
-        await call_with_retry(
+
+        sent = await call_with_retry(
             "copy_message_caption",
             lambda: context.bot.copy_message(
                 chat_id=chat_id,
@@ -545,18 +685,22 @@ async def copy_with_caption(
                 caption=cap_html,
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
+                reply_to_message_id=reply_to_message_id,
             ),
         )
-    else:
-        await call_with_retry(
-            "copy_message",
-            lambda: context.bot.copy_message(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-            ),
-        )
+        return sent
+
+    sent = await call_with_retry(
+        "copy_message",
+        lambda: context.bot.copy_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            from_chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            reply_to_message_id=reply_to_message_id,
+        ),
+    )
+    return sent
 
 
 # --------- SOPORTE DE ÁLBUM (media_group) ---------
@@ -609,21 +753,25 @@ async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE, key: Tuple[int,
 
         _, _, dst_chat, dst_thread, do_translate = key
 
-        # Tomamos la primera caption disponible en el grupo
         cap_text = ""
         cap_entities: List[MessageEntity] = []
+        first_src_msg: Optional[Message] = None
         for m in msgs:
             if (m.caption or "").strip():
                 cap_text = m.caption or ""
                 cap_entities = m.caption_entities or []
+                first_src_msg = m
                 break
 
         first_caption_html: Optional[str] = None
         if cap_text:
+            name = sender_display_name(first_src_msg or msgs[0])
+            pref = prefix_block(name)
             if do_translate and TRANSLATE:
                 first_caption_html, _ = await translate_visible_html(cap_text, cap_entities)
             else:
                 first_caption_html = build_html_no_translate(cap_text, cap_entities)
+            first_caption_html = cap_with_prefix(pref, first_caption_html, max_len=1024)
 
         media_list: List[InputMediaPhoto | InputMediaVideo | InputMediaDocument | InputMediaAudio] = []
         first_used = False
@@ -638,7 +786,7 @@ async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE, key: Tuple[int,
         if not media_list:
             return
 
-        await call_with_retry(
+        sent_msgs = await call_with_retry(
             "send_media_group",
             lambda: context.bot.send_media_group(
                 chat_id=dst_chat,
@@ -646,6 +794,12 @@ async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE, key: Tuple[int,
                 media=media_list,
             ),
         )
+
+        if sent_msgs and isinstance(sent_msgs, list) and isinstance(dst_chat, int):
+            for i, sm in enumerate(msgs):
+                if i < len(sent_msgs):
+                    db_save_map(sm.chat.id, sm.message_id, int(dst_chat), sent_msgs[i].message_id)
+
     except Exception as e:
         log.exception("Error enviando media group %s: %s", key, e)
         await alert_error(context, f"media_group error: {e}")
@@ -661,11 +815,15 @@ async def replicate_media_with_album_support(
 ):
     mgid = getattr(src_msg, "media_group_id", None)
     if not mgid:
-        # Medio suelto -> usar la lógica existente
-        await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
+        reply_to_id = resolve_reply_to_id(src_msg, int(dest_chat_id)) if isinstance(dest_chat_id, int) else None
+        sent = await copy_with_caption(
+            context, dest_chat_id, dest_thread_id, src_msg,
+            do_translate=do_translate, reply_to_message_id=reply_to_id
+        )
+        if sent and isinstance(dest_chat_id, int):
+            db_save_map(src_msg.chat.id, src_msg.message_id, int(dest_chat_id), sent.message_id)
         return
 
-    # no castear dest_chat_id a int; usar tal cual (str o int)
     key = (src_msg.chat.id, str(mgid), dest_chat_id, dest_thread_id, bool(do_translate))
     bucket = MEDIA_GROUP_BUFFER.setdefault(key, [])
     bucket.append(src_msg)
@@ -688,16 +846,114 @@ async def replicate_message(
     *,
     do_translate: bool,
 ):
-    if src_msg.text:
-        await send_text(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
+    # Anti-loop interno: si ya es del bot, no repliques
+    if is_from_bot(src_msg, context):
         return
-    # Soporta medios sueltos y álbumes
-    await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+
+    reply_to_id = None
+    if isinstance(dest_chat_id, int):
+        reply_to_id = resolve_reply_to_id(src_msg, dest_chat_id)
+
+    if src_msg.text:
+        sent = await send_text(
+            context, dest_chat_id, dest_thread_id, src_msg,
+            do_translate=do_translate, reply_to_message_id=reply_to_id
+        )
+        if sent and isinstance(dest_chat_id, int):
+            db_save_map(src_msg.chat.id, src_msg.message_id, dest_chat_id, sent.message_id)
+        return
+
+    await replicate_media_with_album_support(
+        context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate
+    )
+
+    mgid = getattr(src_msg, "media_group_id", None)
+    if mgid and reply_to_id and (src_msg.caption or "").strip() and isinstance(dest_chat_id, int):
+        name = sender_display_name(src_msg)
+        pref = prefix_block(name)
+        cap_text = src_msg.caption or ""
+        cap_entities = src_msg.caption_entities or []
+        if do_translate and TRANSLATE:
+            cap_html, _ = await translate_visible_html(cap_text, cap_entities)
+        else:
+            cap_html = build_html_no_translate(cap_text, cap_entities)
+        cap_html = cap_with_prefix(pref, cap_html, max_len=3500)
+        await call_with_retry(
+            "reply_album_caption",
+            lambda: context.bot.send_message(
+                chat_id=dest_chat_id,
+                message_thread_id=dest_thread_id,
+                text=cap_html,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_to_message_id=reply_to_id,
+            )
+        )
 
 
-# ================== COMANDOS DE EDICIÓN (NUEVO) ==================
-ADMIN_SET = {ADMIN_ID, ANON_ADMIN_ID}
-PENDING_MEDIA: Dict[int, Dict[str, Any]] = {}  # por usuario: {"chat_id":..., "message_id":...}
+# ================== EDICIONES (AUTO SYNC) ==================
+async def replicate_edit(
+    context: ContextTypes.DEFAULT_TYPE,
+    src_msg: Message,
+    dest_chat_id: int,
+    dest_thread_id: Optional[int],
+    *,
+    do_translate: bool,
+):
+    dst_msg_id = db_get_dst_msg(src_msg.chat.id, src_msg.message_id, dest_chat_id)
+    if not dst_msg_id:
+        return
+
+    if src_msg.text:
+        name = sender_display_name(src_msg)
+        pref = prefix_block(name)
+        if do_translate and TRANSLATE:
+            html_text, _ = await translate_visible_html(src_msg.text or "", src_msg.entities or [])
+        else:
+            html_text = build_html_no_translate(src_msg.text or "", src_msg.entities or [])
+        html_text = pref + html_text
+
+        try:
+            await call_with_retry(
+                "edit_message_text",
+                lambda: context.bot.edit_message_text(
+                    chat_id=dest_chat_id,
+                    message_id=dst_msg_id,
+                    text=html_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                ),
+            )
+        except BadRequest as e:
+            log.warning("edit_message_text failed -> try caption: %s", e)
+
+    cap = (src_msg.caption or "").strip()
+    if cap:
+        name = sender_display_name(src_msg)
+        pref = prefix_block(name)
+        if do_translate and TRANSLATE:
+            cap_html, _ = await translate_visible_html(src_msg.caption or "", src_msg.caption_entities or [])
+        else:
+            cap_html = build_html_no_translate(src_msg.caption or "", src_msg.caption_entities or [])
+        cap_html = cap_with_prefix(pref, cap_html, max_len=1024)
+
+        await call_with_retry(
+            "edit_message_caption",
+            lambda: context.bot.edit_message_caption(
+                chat_id=dest_chat_id,
+                message_id=dst_msg_id,
+                caption=cap_html,
+                parse_mode=ParseMode.HTML,
+            ),
+        )
+
+
+# ================== COMANDOS DE EDICIÓN (opcionales) ==================
+ADMIN_SET = {ANON_ADMIN_ID}
+if ADMIN_ID:
+    ADMIN_SET.add(ADMIN_ID)
+
+PENDING_MEDIA: Dict[int, Dict[str, Any]] = {}
 
 
 def _is_admin(uid: Optional[int]) -> bool:
@@ -705,9 +961,8 @@ def _is_admin(uid: Optional[int]) -> bool:
 
 
 async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ /edit <message_id> <texto nuevo>  -> edita texto o caption """
     user = update.effective_user
-    if not _is_admin(user.id):
+    if not _is_admin(getattr(user, "id", None)):
         return
     if not context.args or len(context.args) < 2:
         await update.effective_message.reply_text("Uso: /edit <message_id> <texto nuevo>")
@@ -749,9 +1004,8 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_editmedia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ /editmedia <message_id>  -> luego envías el NUEVO medio """
     user = update.effective_user
-    if not _is_admin(user.id):
+    if not _is_admin(getattr(user, "id", None)):
         return
     if not context.args or len(context.args) < 1:
         await update.effective_message.reply_text(
@@ -792,11 +1046,16 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
             return
 
+        # ✅ Dedup
+        if seen_recent(chat.id, msg.message_id):
+            return
+
+        # ✅ Anti-loop: si viene desde un tema destino, no replicar
+        if is_destination_topic(chat.id, msg.message_thread_id):
+            return
+
         thread_id = msg.message_thread_id
         sender_id = msg.from_user.id if msg.from_user else None
-
-        if chat.id == G1:
-            logging.info("[CHAT DEBUG] thread_id=%s sender=%s", thread_id, sender_id)
 
         route = map_topic(chat.id, thread_id, sender_id)
         if not route:
@@ -815,14 +1074,12 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg.message_id,
         )
 
-        # FIX: si falla una ruta por timeout/429, no debe bloquear el resto (fanout)
         try:
             await replicate_message(context, msg, dst_chat, dst_thread, do_translate=do_translate_main)
         except Exception as e:
             log.warning("Fallo ruta principal %s#%s -> %s#%s: %s", chat.id, thread_id, dst_chat, dst_thread, e)
             await alert_error(context, f"Ruta principal fallo: {chat.id}#{thread_id} -> {dst_chat}#{dst_thread}\n{e}")
 
-        # --- FAN-OUT EXTRA ---
         tid_norm = thread_id if thread_id is not None else 1
         extras = FANOUT_ROUTES.get((chat.id, tid_norm), [])
         for extra_chat, extra_thread in extras:
@@ -847,6 +1104,52 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await alert_error(context, f"on_group_post: {e}")
 
 
+async def on_group_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = update.edited_message
+        chat = update.effective_chat
+        if not msg or not chat:
+            return
+        if chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
+            return
+
+        # ✅ Dedup edits
+        if seen_recent(chat.id, msg.message_id):
+            return
+
+        # ✅ Anti-loop edits
+        if is_destination_topic(chat.id, msg.message_thread_id):
+            return
+
+        thread_id = msg.message_thread_id
+        sender_id = msg.from_user.id if msg.from_user else None
+
+        route = map_topic(chat.id, thread_id, sender_id)
+        if not route:
+            return
+        dst_chat, dst_thread = route
+        if not isinstance(dst_chat, int):
+            return
+
+        do_translate_main = not route_no_translate(chat.id, thread_id, dst_chat, dst_thread)
+
+        log.info(
+            "EDIT Group %s#%s → %s#%s | translate=%s | msg %s",
+            chat.id,
+            thread_id if thread_id is not None else 1,
+            dst_chat,
+            dst_thread,
+            do_translate_main,
+            msg.message_id,
+        )
+
+        await replicate_edit(context, msg, dst_chat, dst_thread, do_translate=do_translate_main)
+
+    except Exception as e:
+        log.exception("Error on_group_edit")
+        await alert_error(context, f"on_group_edit: {e}")
+
+
 # ================== MAIN ==================
 def ensure_env():
     if not BOT_TOKEN:
@@ -855,8 +1158,8 @@ def ensure_env():
 
 def main():
     ensure_env()
+    db_init()
 
-    # FIX: timeouts más amplios/estables en Railway (picos de red/Telegram)
     request = HTTPXRequest(
         connect_timeout=20.0,
         read_timeout=60.0,
@@ -867,19 +1170,27 @@ def main():
     app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_post))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.EDITED_MESSAGE, on_group_edit))
 
-    # (Opcional) comandos de edición si los usas:
+    # Opcional
     app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CommandHandler("editmedia", cmd_editmedia))
 
     log.info(
-        "Replicator iniciado. Translate=%s, Buttons=%s | ENV_SRC=%s ENV_DST=%s",
+        "Replicator iniciado. Translate=%s, Buttons=%s | ENV_SRC=%s ENV_DST=%s | DB=%s | DedupTTL=%ss",
         TRANSLATE,
         TRANSLATE_BUTTONS,
         ENV_SRC,
         ENV_DST,
+        str(DB_PATH),
+        str(DEDUP_TTL_SECONDS),
     )
-    app.run_polling(allowed_updates=["channel_post", "message"], poll_interval=1.2, stop_signals=None)
+
+    app.run_polling(
+        allowed_updates=["channel_post", "message", "edited_message"],
+        poll_interval=1.2,
+        stop_signals=None
+    )
 
 
 if __name__ == "__main__":

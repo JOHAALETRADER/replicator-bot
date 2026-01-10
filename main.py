@@ -277,7 +277,7 @@ pullback\tpullback
 order block\torder block
 liquidity\tliquidity
 spread\tspread
-hedging\thedding
+hedging\hedging
 derivatives\tderivatives
 leverage\tleverage
 support\tsupport

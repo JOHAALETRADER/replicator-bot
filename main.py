@@ -1189,7 +1189,9 @@ def main():
     app.run_polling(
         allowed_updates=["channel_post", "message", "edited_message"],
         poll_interval=1.2,
-        stop_signals=None
+        stop_signals=None,
+        drop_pending_updates=True
+
     )
 
 

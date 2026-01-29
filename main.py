@@ -3,6 +3,7 @@ import html
 import logging
 import re
 import asyncio
+import io
 import sqlite3
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Callable, Awaitable
@@ -45,6 +46,16 @@ TARGET_LANG = os.getenv("TARGET_LANG", "EN").upper()
 FORMALITY = os.getenv("FORMALITY", "default")
 FORCE_TRANSLATE = os.getenv("FORCE_TRANSLATE", "false").lower() == "true"
 TRANSLATE_BUTTONS = os.getenv("TRANSLATE_BUTTONS", "true").lower() == "true"
+# Audio → Texto (STT) + Texto (DeepL) + Audio (TTS)
+AUDIO_TRANSLATE = os.getenv("AUDIO_TRANSLATE", "true").lower() == "true"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1").strip()
+# Modelos comunes: tts-1 / tts-1-hd / gpt-4o-tts (según tu cuenta)
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "tts-1").strip()
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
+OPENAI_TTS_FORMAT = os.getenv("OPENAI_TTS_FORMAT", "mp3").strip()
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "60") or "60")
 
 # Glosario DeepL
 GLOSSARY_ID = os.getenv("GLOSSARY_ID", "").strip()
@@ -367,6 +378,138 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
             return text
         js = await r.json()
         return js["translations"][0]["text"]
+
+# ================== OPENAI STT/TTS (AUDIO) ==================
+async def openai_transcribe(audio_bytes: bytes, filename: str, mime: str, *, language_hint: str) -> str:
+    """
+    Speech-to-text con OpenAI (Whisper). Devuelve texto en el idioma original.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Falta OPENAI_API_KEY para transcribir audio.")
+    url = f"{OPENAI_BASE_URL}/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+    form = aiohttp.FormData()
+    form.add_field("model", OPENAI_STT_MODEL)
+    # Whisper usa language como 'es', 'en', etc. (mejor esfuerzo)
+    if language_hint:
+        form.add_field("language", language_hint.lower())
+    form.add_field("file", audio_bytes, filename=filename, content_type=mime or "application/octet-stream")
+
+    timeout = aiohttp.ClientTimeout(total=OPENAI_TIMEOUT_SEC)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, data=form) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"OpenAI STT HTTP {resp.status}: {body[:400]}")
+            js = await resp.json()
+            return (js.get("text") or "").strip()
+
+async def openai_tts(text_en: str) -> bytes:
+    """
+    Text-to-speech con OpenAI. Devuelve bytes de audio (mp3 por defecto).
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Falta OPENAI_API_KEY para generar audio (TTS).")
+    if not text_en.strip():
+        return b""
+    url = f"{OPENAI_BASE_URL}/audio/speech"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_TTS_MODEL,
+        "voice": OPENAI_TTS_VOICE,
+        "input": text_en,
+        "format": OPENAI_TTS_FORMAT,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=OPENAI_TIMEOUT_SEC)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"OpenAI TTS HTTP {resp.status}: {body[:400]}")
+            return await resp.read()
+
+async def replicate_audio_with_translation(
+    context: ContextTypes.DEFAULT_TYPE,
+    src_msg: Message,
+    dest_chat_id: int | str,
+    dest_thread_id: Optional[int],
+    *,
+    do_translate: bool,
+):
+    """
+    Si llega un audio/voice y la ruta es de traducción:
+      1) STT (OpenAI) -> texto ES
+      2) DeepL -> texto EN
+      3) TTS (OpenAI) -> audio EN
+      4) Enviar audio + texto EN (con botones traducidos si aplica)
+    """
+    if not AUDIO_TRANSLATE or not do_translate:
+        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+        return
+
+    # Solo audios sueltos (no álbum). Si viene en álbum, se mantiene como está.
+    if getattr(src_msg, "media_group_id", None):
+        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+        return
+
+    audio_obj = getattr(src_msg, "voice", None) or getattr(src_msg, "audio", None)
+    if not audio_obj:
+        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+        return
+
+    file_id = audio_obj.file_id
+    filename = getattr(audio_obj, "file_name", None) or ("voice.ogg" if getattr(src_msg, "voice", None) else "audio.mp3")
+    mime = getattr(audio_obj, "mime_type", None) or ("audio/ogg" if filename.endswith(".ogg") else "audio/mpeg")
+
+    # Descarga del audio desde Telegram
+    tg_file = await context.bot.get_file(file_id)
+    audio_bytes = bytes(await tg_file.download_as_bytearray())
+
+    # 1) STT
+    src_text = await openai_transcribe(audio_bytes, filename, mime, language_hint=SOURCE_LANG)
+
+    # 2) DeepL -> EN
+    timeout = aiohttp.ClientTimeout(total=45)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        text_en = await deepl_translate(src_text, session=session)
+
+    # 3) TTS
+    audio_en = await openai_tts(text_en)
+
+    # 4) Enviar audio EN
+    # - Caption corta (Telegram limita), y el texto completo va aparte.
+    cap = (text_en[:950] + "…") if len(text_en) > 950 else text_en
+    bio = io.BytesIO(audio_en)
+    bio.name = f"translated.{OPENAI_TTS_FORMAT or 'mp3'}"
+
+    sent_audio = await context.bot.send_audio(
+        chat_id=dest_chat_id,
+        message_thread_id=dest_thread_id,
+        audio=bio,
+        caption=cap if cap else None,
+    )
+
+    # Guardar mapping para replies (si aplica y el destino es chat_id int)
+    try:
+        if isinstance(dest_chat_id, int):
+            db_save_map(int(src_msg.chat.id), int(src_msg.message_id), int(dest_chat_id), int(sent_audio.message_id))
+    except Exception:
+        pass
+
+    # Texto completo + botones (traducidos)
+    kb = await translate_buttons(src_msg.reply_markup, do_translate=True)
+    html_text = html.escape(text_en, quote=False)
+    if html_text.strip():
+        await context.bot.send_message(
+            chat_id=dest_chat_id,
+            message_thread_id=dest_thread_id,
+            text=html_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=kb,
+        )
 
 
 # ================== TRADUCCIÓN VISIBLE ==================
@@ -854,6 +997,15 @@ async def replicate_message(
     if isinstance(dest_chat_id, int):
         reply_to_id = resolve_reply_to_id(src_msg, dest_chat_id)
 
+    
+    # --- AUDIO: transcribir + traducir + reenviar como audio EN + texto EN ---
+    if (getattr(src_msg, "voice", None) or getattr(src_msg, "audio", None)) and do_translate:
+        try:
+            await replicate_audio_with_translation(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+            return
+        except Exception as e:
+            # Si falla STT/TTS, hacemos fallback al comportamiento original (copiar audio)
+            log.warning("Audio translate fallback (msg %s): %s", src_msg.message_id, e)
     if src_msg.text:
         sent = await send_text(
             context, dest_chat_id, dest_thread_id, src_msg,

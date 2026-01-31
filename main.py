@@ -430,6 +430,34 @@ async def openai_tts(text_en: str) -> bytes:
                 raise RuntimeError(f"OpenAI TTS HTTP {resp.status}: {body[:400]}")
             return await resp.read()
 
+async def _download_file_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> tuple[bytes, str]:
+    """
+    Descarga bytes de un file_id y devuelve (bytes, filename_sugerido).
+    Compatible con PTB 21.x (download_as_bytearray / download_to_memory).
+    """
+    tg_file = await context.bot.get_file(file_id)
+    filename = "audio"
+    try:
+        # intenta inferir extensión desde file_path
+        fp = getattr(tg_file, "file_path", "") or ""
+        if "/" in fp:
+            base = fp.split("/")[-1]
+            if "." in base:
+                filename = base
+            else:
+                filename = "audio"
+    except Exception:
+        pass
+
+    # Descargar bytes
+    try:
+        b = await tg_file.download_as_bytearray()
+        return (bytes(b), filename)
+    except Exception:
+        bio = io.BytesIO()
+        await tg_file.download_to_memory(out=bio)
+        return (bio.getvalue(), filename)
+
 async def replicate_audio_with_translation(
     context: ContextTypes.DEFAULT_TYPE,
     src_msg: Message,
@@ -439,124 +467,75 @@ async def replicate_audio_with_translation(
     do_translate: bool,
 ):
     """
-    Si llega un audio/voice y la ruta es de traducción:
-      1) STT (OpenAI) -> texto ES
-      2) DeepL -> texto EN
-      3) TTS (OpenAI) -> audio EN
-      4) Enviar audio + texto EN (con botones traducidos si aplica)
+    Para voice/audio:
+      - Mantiene el audio ORIGINAL (sin cambiar voz).
+      - Transcribe → traduce → envía el texto TRADUCIDO como caption pegado al audio.
+      - NO envía un segundo mensaje (sin duplicados).
     """
-    if not AUDIO_TRANSLATE or not do_translate:
-        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
-        return
-
-    # Solo audios sueltos (no álbum). Si viene en álbum, se mantiene como está.
-    if getattr(src_msg, "media_group_id", None):
-        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
-        return
-
-    audio_obj = getattr(src_msg, "voice", None) or getattr(src_msg, "audio", None)
-    if not audio_obj:
-        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
-        return
-
-    file_id = audio_obj.file_id
-    filename = getattr(audio_obj, "file_name", None) or ("voice.ogg" if getattr(src_msg, "voice", None) else "audio.mp3")
-    mime = getattr(audio_obj, "mime_type", None) or ("audio/ogg" if filename.endswith(".ogg") else "audio/mpeg")
-
-    # Descarga del audio desde Telegram
-    tg_file = await context.bot.get_file(file_id)
-    audio_bytes = bytes(await tg_file.download_as_bytearray())
-
-    # 1) STT
-    src_text = await openai_transcribe(audio_bytes, filename, mime, language_hint=SOURCE_LANG)
-
-    # 2) DeepL -> EN
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        text_en = await deepl_translate(src_text, session=session)
-
-    # 3) TTS
-    audio_en = await openai_tts(text_en)
-
-    # 4) Enviar audio EN
-    # - Caption corta (Telegram limita), y el texto completo va aparte.
-    cap = (text_en[:950] + "…") if len(text_en) > 950 else text_en
-    bio = io.BytesIO(audio_en)
-    bio.name = f"translated.{OPENAI_TTS_FORMAT or 'mp3'}"
-
-    sent_audio = await context.bot.send_audio(
-        chat_id=dest_chat_id,
-        message_thread_id=dest_thread_id,
-        audio=bio,
-        caption=cap if cap else None,
-    )
-
-    # Guardar mapping para replies (si aplica y el destino es chat_id int)
-    try:
-        if isinstance(dest_chat_id, int):
-            db_save_map(int(src_msg.chat.id), int(src_msg.message_id), int(dest_chat_id), int(sent_audio.message_id))
-    except Exception:
-        pass
-
-    # Texto completo + botones (traducidos)
-    kb = await translate_buttons(src_msg.reply_markup, do_translate=True)
-    html_text = html.escape(text_en, quote=False)
-    if html_text.strip():
-        await context.bot.send_message(
+    if not do_translate or not AUDIO_TRANSLATE:
+        # Comportamiento normal
+        await context.bot.copy_message(
             chat_id=dest_chat_id,
             message_thread_id=dest_thread_id,
-            text=html_text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=kb,
+            from_chat_id=src_msg.chat.id,
+            message_id=src_msg.message_id,
         )
+        return
 
+    # 1) Elegir file_id y tipo
+    file_id: Optional[str] = None
+    if getattr(src_msg, "voice", None):
+        file_id = src_msg.voice.file_id
+    elif getattr(src_msg, "audio", None):
+        file_id = src_msg.audio.file_id
+    else:
+        # Si llega aquí por error, replicar normal
+        await context.bot.copy_message(
+            chat_id=dest_chat_id,
+            message_thread_id=dest_thread_id,
+            from_chat_id=src_msg.chat.id,
+            message_id=src_msg.message_id,
+        )
+        return
 
-# ================== TRADUCCIÓN VISIBLE ==================
-async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
-    frags = entities_to_html(text, entities or [])
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        new_frags: List[Tuple[str, Dict[str, Any]]] = []
-        for frag, meta in frags:
-            if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
-                new_text = await deepl_translate(frag, session=session)
-                new_frags.append((new_text, meta))
-            else:
-                new_frags.append((frag, meta))
-    html_text = build_html(new_frags)
-    return html_text, []
+    # 2) Descargar audio original
+    audio_bytes, filename = await _download_file_bytes(context, file_id)
 
+    # 3) Transcribir con OpenAI
+    transcript = await openai_stt_from_voice_or_audio(context, src_msg)
+    if not transcript.strip():
+        # si no pudimos transcribir, al menos manda el audio original
+        await context.bot.send_audio(
+            chat_id=dest_chat_id,
+            message_thread_id=dest_thread_id,
+            audio=io.BytesIO(audio_bytes),
+            filename=filename,
+        )
+        return
 
-def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
-    return build_html(entities_to_html(text, entities or []))
+    # 4) Traducir a EN con DeepL (solo texto; el audio se mantiene igual)
+    caption_text = transcript
+    if TRANSLATE and do_translate:
+        try:
+            timeout = aiohttp.ClientTimeout(total=OPENAI_TIMEOUT_SEC)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                caption_text = await deepl_translate(transcript, session=session)
+        except Exception:
+            caption_text = transcript
 
+    caption_text = (caption_text or "").strip()
+    if len(caption_text) > 1024:
+        caption_text = caption_text[:1020] + "…"
 
-async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_translate: bool) -> Optional[InlineKeyboardMarkup]:
-    if not markup or not TRANSLATE_BUTTONS or not getattr(markup, "inline_keyboard", None):
-        return markup
-    if not do_translate:
-        return markup
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        rows: List[List[InlineKeyboardButton]] = []
-        for row in markup.inline_keyboard:
-            new_row: List[InlineKeyboardButton] = []
-            for b in row:
-                label = await deepl_translate(b.text or "", session=session)
-                new_row.append(
-                    InlineKeyboardButton(
-                        text=(label or "")[:64],
-                        url=b.url,
-                        callback_data=b.callback_data,
-                        switch_inline_query=b.switch_inline_query,
-                        switch_inline_query_current_chat=b.switch_inline_query_current_chat,
-                        web_app=getattr(b, "web_app", None),
-                        login_url=getattr(b, "login_url", None),
-                    )
-                )
-            rows.append(new_row)
-        return InlineKeyboardMarkup(rows)
+    # 5) Enviar audio ORIGINAL como AUDIO (no voice) con caption traducido pegado
+    #    Nota: enviar como audio permite caption; voice notes no soportan caption.
+    await context.bot.send_audio(
+        chat_id=dest_chat_id,
+        message_thread_id=dest_thread_id,
+        audio=io.BytesIO(audio_bytes),
+        filename=filename,
+        caption=caption_text,
+    )
 
 
 # ================== MAPEO DE REPLY/EDITS (SQLite persistente) ==================

@@ -438,509 +438,82 @@ async def replicate_audio_with_translation(
     *,
     do_translate: bool,
 ):
+    """Replica voice/audio manteniendo el audio ORIGINAL y agregando SOLO el texto traducido en el caption.
+
+    - No genera TTS (no cambia voz).
+    - El texto va pegado al audio (caption), no en un mensaje aparte.
+    - Si falla STT/DeepL, hace fallback a la réplica normal.
     """
-    Si llega un audio/voice y la ruta es de traducción:
-      1) STT (OpenAI) -> texto ES
-      2) DeepL -> texto EN
-      3) TTS (OpenAI) -> audio EN
-      4) Enviar audio + texto EN (con botones traducidos si aplica)
-    """
-    if not AUDIO_TRANSLATE or not do_translate:
-        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
-        return
-
-    # Solo audios sueltos (no álbum). Si viene en álbum, se mantiene como está.
-    if getattr(src_msg, "media_group_id", None):
-        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
-        return
-
-    audio_obj = getattr(src_msg, "voice", None) or getattr(src_msg, "audio", None)
-    if not audio_obj:
-        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
-        return
-
-    file_id = audio_obj.file_id
-    filename = getattr(audio_obj, "file_name", None) or ("voice.ogg" if getattr(src_msg, "voice", None) else "audio.mp3")
-    mime = getattr(audio_obj, "mime_type", None) or ("audio/ogg" if filename.endswith(".ogg") else "audio/mpeg")
-
-    # Descarga del audio desde Telegram
-    tg_file = await context.bot.get_file(file_id)
-    audio_bytes = bytes(await tg_file.download_as_bytearray())
-
-    # 1) STT
-    src_text = await openai_transcribe(audio_bytes, filename, mime, language_hint=SOURCE_LANG)
-
-    # 2) DeepL -> EN
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        text_en = await deepl_translate(src_text, session=session)
-
-    # 3) Enviar AUDIO ORIGINAL + caption traducido (SIN TTS)
-    # Nota: Telegram no permite caption en "voice note" (mensaje de voz). Para mantener audio original
-    # y pegar el texto en el mismo mensaje, lo enviamos como AUDIO con el mismo contenido.
-    cap = (text_en[:950] + "…") if len(text_en) > 950 else text_en
-    cap_html = html.escape(cap, quote=False) if cap else None
-
-    # Intentamos conservar reply_markup (botones) traducidos si existen
-    kb = await translate_buttons(src_msg.reply_markup, do_translate=True)
-
-    bio = io.BytesIO(file_bytes)
-    ext = os.path.splitext(file_path or "")[1].lower()
-    if not ext:
-        # fallback por tipo
-        ext = ".ogg" if is_voice else ".bin"
-    bio.name = f"audio_original{ext}"
-
-    sent_audio = await context.bot.send_audio(
-        chat_id=dest_chat_id,
-        message_thread_id=dest_thread_id,
-        audio=bio,
-        caption=cap_html,
-        parse_mode=ParseMode.HTML if cap_html else None,
-        reply_markup=kb,
-    )
-
-    # Guardar mapping para replies (si aplica y el destino es chat_id int)
     try:
-        if isinstance(dest_chat_id, int):
-            db_save_map(int(src_msg.chat.id), int(src_msg.message_id), int(dest_chat_id), int(sent_audio.message_id))
-    except Exception:
-        pass
+        if not AUDIO_TRANSLATE or not do_translate:
+            await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+            return
 
-# ================== TRADUCCIÓN VISIBLE ==================
-async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
-    frags = entities_to_html(text, entities or [])
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        new_frags: List[Tuple[str, Dict[str, Any]]] = []
-        for frag, meta in frags:
-            if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
-                new_text = await deepl_translate(frag, session=session)
-                new_frags.append((new_text, meta))
-            else:
-                new_frags.append((frag, meta))
-    html_text = build_html(new_frags)
-    return html_text, []
+        is_voice = bool(getattr(src_msg, "voice", None))
+        is_audio = bool(getattr(src_msg, "audio", None))
+        if not (is_voice or is_audio):
+            await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+            return
 
+        if not OPENAI_API_KEY:
+            await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+            return
 
-def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
-    return build_html(entities_to_html(text, entities or []))
+        # Descargar bytes desde Telegram
+        file_id = src_msg.voice.file_id if is_voice else src_msg.audio.file_id
+        tg_file = await context.bot.get_file(file_id)
+        audio_url = tg_file.file_path
 
+        timeout = aiohttp.ClientTimeout(total=max(30, int(OPENAI_TIMEOUT_SEC or 60)))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(audio_url) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"Telegram get_file HTTP {r.status}")
+                audio_bytes = await r.read()
 
-async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_translate: bool) -> Optional[InlineKeyboardMarkup]:
-    if not markup or not TRANSLATE_BUTTONS or not getattr(markup, "inline_keyboard", None):
-        return markup
-    if not do_translate:
-        return markup
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        rows: List[List[InlineKeyboardButton]] = []
-        for row in markup.inline_keyboard:
-            new_row: List[InlineKeyboardButton] = []
-            for b in row:
-                label = await deepl_translate(b.text or "", session=session)
-                new_row.append(
-                    InlineKeyboardButton(
-                        text=(label or "")[:64],
-                        url=b.url,
-                        callback_data=b.callback_data,
-                        switch_inline_query=b.switch_inline_query,
-                        switch_inline_query_current_chat=b.switch_inline_query_current_chat,
-                        web_app=getattr(b, "web_app", None),
-                        login_url=getattr(b, "login_url", None),
-                    )
-                )
-            rows.append(new_row)
-        return InlineKeyboardMarkup(rows)
+            # STT (OpenAI): devuelve texto en el idioma original
+            # Nota: openai_transcribe abre su propia sesión por dentro.
+            transcript = await openai_transcribe(
+                audio_bytes=audio_bytes,
+                filename=("voice.ogg" if is_voice else "audio.bin"),
+                mime=("audio/ogg" if is_voice else "application/octet-stream"),
+                language_hint=(SOURCE_LANG or "ES").lower(),
+            )
+            transcript = (transcript or "").strip()
+            if not transcript:
+                await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
+                return
 
+            # Traducir a EN con DeepL
+            translated = await deepl_translate(transcript, session=session)
+            translated = (translated or transcript).strip()
 
-# ================== MAPEO DE REPLY/EDITS (SQLite persistente) ==================
-DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
-DB_PATH = Path(os.getenv("REPL_DB_PATH", str(DATA_DIR / "replicator_map.db")))
+        # Caption máximo ~1024. Dejamos margen.
+        caption = translated[:1000]
 
-_DB_CONN: Optional[sqlite3.Connection] = None
+        kb = await translate_buttons(src_msg.reply_markup, do_translate=True)
 
-
-def db_init():
-    global _DB_CONN
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _DB_CONN = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    _DB_CONN.execute("""
-        CREATE TABLE IF NOT EXISTS msg_map (
-            src_chat INTEGER NOT NULL,
-            src_msg  INTEGER NOT NULL,
-            dst_chat INTEGER NOT NULL,
-            dst_msg  INTEGER NOT NULL,
-            PRIMARY KEY (src_chat, src_msg, dst_chat)
-        )
-    """)
-    _DB_CONN.execute("CREATE INDEX IF NOT EXISTS idx_src ON msg_map (src_chat, src_msg)")
-    _DB_CONN.commit()
-
-
-def db_save_map(src_chat: int, src_msg: int, dst_chat: int, dst_msg: int):
-    if not _DB_CONN:
-        db_init()
-    try:
-        _DB_CONN.execute(
-            "INSERT OR REPLACE INTO msg_map (src_chat, src_msg, dst_chat, dst_msg) VALUES (?, ?, ?, ?)",
-            (int(src_chat), int(src_msg), int(dst_chat), int(dst_msg))
-        )
-        _DB_CONN.commit()
-    except Exception as e:
-        log.warning("db_save_map failed: %s", e)
-
-
-def db_get_dst_msg(src_chat: int, src_msg: int, dst_chat: int) -> Optional[int]:
-    if not _DB_CONN:
-        db_init()
-    try:
-        cur = _DB_CONN.execute(
-            "SELECT dst_msg FROM msg_map WHERE src_chat=? AND src_msg=? AND dst_chat=? LIMIT 1",
-            (int(src_chat), int(src_msg), int(dst_chat))
-        )
-        row = cur.fetchone()
-        return int(row[0]) if row else None
-    except Exception:
-        return None
-
-
-# ================== PREFIJO "👤 Nombre:" ==================
-def sender_display_name(msg: Message) -> str:
-    # Anonymous admin / sender_chat
-    if getattr(msg, "sender_chat", None):
-        try:
-            return (msg.sender_chat.title or "Anonymous").strip()
-        except Exception:
-            return "Anonymous"
-    if msg.from_user:
-        try:
-            return (msg.from_user.full_name or msg.from_user.first_name or "Usuario").strip()
-        except Exception:
-            return "Usuario"
-    return "Usuario"
-
-
-def prefix_block(name: str) -> str:
-    name = (name or "Usuario").strip()
-    return f"👤 Nombre: {name}\n\n"
-
-
-def cap_with_prefix(prefix: str, cap_html: str, max_len: int = 1024) -> str:
-    out = (prefix + cap_html).strip()
-    if len(out) <= max_len:
-        return out
-    return out[: max_len - 1] + "…"
-
-
-# ================== MAPEO ==================
-def map_channel(src_chat: Chat) -> Optional[int | str]:
-    src_id = int(src_chat.id)
-    src_uname = ("@" + (src_chat.username or "").lower()) if src_chat.username else None
-
-    if ENV_SRC_ID is not None and src_id == ENV_SRC_ID:
-        return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
-    if ENV_SRC_UNAME and src_uname and src_uname == ENV_SRC_UNAME:
-        return ENV_DST_ID if ENV_DST_ID is not None else (ENV_DST_UNAME or None)
-
-    if src_id in CHANNEL_MAP:
-        return CHANNEL_MAP[src_id]
-    if str(src_id) in CHANNEL_MAP:
-        return CHANNEL_MAP[str(src_id)]
-    if src_uname and src_uname in CHANNEL_MAP:
-        return CHANNEL_MAP[src_uname]
-
-    return None
-
-
-def map_topic(src_chat_id: int, src_thread_id: Optional[int], sender_id: Optional[int]) -> Optional[Tuple[int, int]]:
-    """
-    Mapea (chat, thread) → (chat, thread). Reglas:
-      1) Coincidencia exacta en TOPIC_ROUTES.
-      2) Si thread_id es None/0, normaliza a 1 y vuelve a buscar.
-    """
-    if src_thread_id is not None:
-        route = TOPIC_ROUTES.get((src_chat_id, src_thread_id))
-        if route:
-            dst_chat, dst_thread, only_sender = route
-            if only_sender:
-                if sender_id == only_sender:
-                    return (dst_chat, dst_thread)
-                return None
-            return (dst_chat, dst_thread)
-
-    tid = 1 if (src_thread_id in (None, 0)) else src_thread_id
-    route = TOPIC_ROUTES.get((src_chat_id, tid))
-    if route:
-        dst_chat, dst_thread, only_sender = route
-        if only_sender:
-            if sender_id == only_sender:
-                return (dst_chat, dst_thread)
-            return None
-        return (dst_chat, dst_thread)
-
-    return None
-
-
-def route_no_translate(src_chat: int, src_thread: Optional[int], dst_chat: int, dst_thread: int) -> bool:
-    tid = src_thread if src_thread is not None else 1
-    return (src_chat, tid, dst_chat, dst_thread) in NO_TRANSLATE_ROUTES
-
-
-async def alert_error(context: ContextTypes.DEFAULT_TYPE, text: str):
-    if ERROR_ALERT and ADMIN_ID:
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ {text[:3800]}")
-        except Exception:
-            pass
-
-
-# ================== FIX: RETRIES / TIMEOUTS ==================
-async def call_with_retry(
-    label: str,
-    fn: Callable[[], Awaitable[Any]],
-    *,
-    tries: int = 4,
-    base_delay: float = 1.2,
-):
-    last_exc: Exception | None = None
-    for i in range(1, tries + 1):
-        try:
-            return await fn()
-        except RetryAfter as e:
-            last_exc = e
-            wait_s = float(getattr(e, "retry_after", 1.0))
-            log.warning("[%s] RetryAfter %ss (intento %s/%s)", label, wait_s, i, tries)
-            await asyncio.sleep(wait_s + 0.2)
-        except (TimedOut, NetworkError) as e:
-            last_exc = e
-            wait = base_delay * (2 ** (i - 1))
-            log.warning("[%s] Timeout/NetworkError (intento %s/%s). Esperando %.1fs. Err=%s", label, i, tries, wait, e)
-            await asyncio.sleep(wait)
-        except BadRequest as e:
-            log.error("[%s] BadRequest: %s", label, e)
-            raise
-        except Forbidden as e:
-            log.error("[%s] Forbidden: %s", label, e)
-            raise
-        except Exception as e:
-            last_exc = e
-            wait = base_delay * (2 ** (i - 1))
-            log.warning("[%s] Error inesperado (intento %s/%s). Esperando %.1fs. Err=%s", label, i, tries, wait, e)
-            await asyncio.sleep(wait)
-
-    if last_exc:
-        raise last_exc
-
-
-# ================== HELPERS REPLY/LOOP ==================
-def is_from_bot(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    try:
-        if msg.from_user and context.bot and msg.from_user.id == context.bot.id:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def resolve_reply_to_id(src_msg: Message, dst_chat: int) -> Optional[int]:
-    try:
-        r = getattr(src_msg, "reply_to_message", None)
-        if not r:
-            return None
-        return db_get_dst_msg(src_msg.chat.id, r.message_id, dst_chat)
-    except Exception:
-        return None
-
-
-# ================== REPLICACIÓN ==================
-async def send_text(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int | str,
-    thread_id: Optional[int],
-    msg: Message,
-    *,
-    do_translate: bool,
-    reply_to_message_id: Optional[int] = None,
-) -> Optional[Message]:
-    name = sender_display_name(msg)
-    pref = prefix_block(name)
-
-    if do_translate and TRANSLATE:
-        html_text, _ = await translate_visible_html(msg.text or "", msg.entities or [])
-    else:
-        html_text = build_html_no_translate(msg.text or "", msg.entities or [])
-
-    html_text = pref + html_text
-    kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
-
-    sent = await call_with_retry(
-        "send_message",
-        lambda: context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-            text=html_text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=kb,
-            reply_to_message_id=reply_to_message_id,
-        ),
-    )
-    return sent
-
-
-async def copy_with_caption(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int | str,
-    thread_id: Optional[int],
-    msg: Message,
-    *,
-    do_translate: bool,
-    reply_to_message_id: Optional[int] = None,
-) -> Optional[Message]:
-    name = sender_display_name(msg)
-    pref = prefix_block(name)
-
-    cap_text = msg.caption or ""
-    cap_entities = msg.caption_entities or []
-
-    if cap_text.strip():
-        if do_translate and TRANSLATE:
-            cap_html, _ = await translate_visible_html(cap_text, cap_entities)
-        else:
-            cap_html = build_html_no_translate(cap_text, cap_entities)
-
-        cap_html = cap_with_prefix(pref, cap_html, max_len=1024)
-        kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
-
-        sent = await call_with_retry(
-            "copy_message_caption",
-            lambda: context.bot.copy_message(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                caption=cap_html,
-                parse_mode=ParseMode.HTML,
+        # Enviar audio ORIGINAL con caption traducido
+        if is_voice:
+            await context.bot.send_voice(
+                chat_id=dest_chat_id,
+                message_thread_id=dest_thread_id,
+                voice=file_id,
+                caption=caption,
                 reply_markup=kb,
-                reply_to_message_id=reply_to_message_id,
-            ),
-        )
-        return sent
-
-    sent = await call_with_retry(
-        "copy_message",
-        lambda: context.bot.copy_message(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-            from_chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            reply_to_message_id=reply_to_message_id,
-        ),
-    )
-    return sent
-
-
-# --------- SOPORTE DE ÁLBUM (media_group) ---------
-MEDIA_GROUP_BUFFER: Dict[Tuple[int, str, Any, Optional[int], bool], List[Message]] = {}
-MEDIA_GROUP_TASKS: Dict[Tuple[int, str, Any, Optional[int], bool], Any] = {}
-MEDIA_GROUP_DELAY = 0.6  # segundos
-
-
-def _msg_has_photo(msg: Message) -> bool:
-    return bool(getattr(msg, "photo", None))
-
-
-def _msg_has_video(msg: Message) -> bool:
-    return bool(getattr(msg, "video", None))
-
-
-def _msg_has_document(msg: Message) -> bool:
-    return bool(getattr(msg, "document", None))
-
-
-def _msg_has_audio(msg: Message) -> bool:
-    return bool(getattr(msg, "audio", None))
-
-
-def _msg_build_input_media(
-    msg: Message,
-    *,
-    caption_html: Optional[str],
-) -> Optional[InputMediaPhoto | InputMediaVideo | InputMediaDocument | InputMediaAudio]:
-    if _msg_has_photo(msg):
-        fid = msg.photo[-1].file_id
-        return InputMediaPhoto(media=fid, caption=caption_html, parse_mode=ParseMode.HTML if caption_html else None)
-    if _msg_has_video(msg):
-        return InputMediaVideo(media=msg.video.file_id, caption=caption_html, parse_mode=ParseMode.HTML if caption_html else None)
-    if _msg_has_document(msg):
-        return InputMediaDocument(media=msg.document.file_id, caption=caption_html, parse_mode=ParseMode.HTML if caption_html else None)
-    if _msg_has_audio(msg):
-        return InputMediaAudio(media=msg.audio.file_id, caption=caption_html, parse_mode=ParseMode.HTML if caption_html else None)
-    return None
-
-
-async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE, key: Tuple[int, str, Any, Optional[int], bool]):
-    try:
-        msgs = MEDIA_GROUP_BUFFER.pop(key, [])
-        MEDIA_GROUP_TASKS.pop(key, None)
-        if not msgs:
-            return
-
-        msgs.sort(key=lambda m: m.message_id)
-
-        _, _, dst_chat, dst_thread, do_translate = key
-
-        cap_text = ""
-        cap_entities: List[MessageEntity] = []
-        first_src_msg: Optional[Message] = None
-        for m in msgs:
-            if (m.caption or "").strip():
-                cap_text = m.caption or ""
-                cap_entities = m.caption_entities or []
-                first_src_msg = m
-                break
-
-        first_caption_html: Optional[str] = None
-        if cap_text:
-            name = sender_display_name(first_src_msg or msgs[0])
-            pref = prefix_block(name)
-            if do_translate and TRANSLATE:
-                first_caption_html, _ = await translate_visible_html(cap_text, cap_entities)
-            else:
-                first_caption_html = build_html_no_translate(cap_text, cap_entities)
-            first_caption_html = cap_with_prefix(pref, first_caption_html, max_len=1024)
-
-        media_list: List[InputMediaPhoto | InputMediaVideo | InputMediaDocument | InputMediaAudio] = []
-        first_used = False
-        for m in msgs:
-            cap = first_caption_html if not first_used else None
-            im = _msg_build_input_media(m, caption_html=cap)
-            if im:
-                media_list.append(im)
-                if cap is not None:
-                    first_used = True
-
-        if not media_list:
-            return
-
-        sent_msgs = await call_with_retry(
-            "send_media_group",
-            lambda: context.bot.send_media_group(
-                chat_id=dst_chat,
-                message_thread_id=dst_thread,
-                media=media_list,
-            ),
-        )
-
-        if sent_msgs and isinstance(sent_msgs, list) and isinstance(dst_chat, int):
-            for i, sm in enumerate(msgs):
-                if i < len(sent_msgs):
-                    db_save_map(sm.chat.id, sm.message_id, int(dst_chat), sent_msgs[i].message_id)
+            )
+        else:
+            await context.bot.send_audio(
+                chat_id=dest_chat_id,
+                message_thread_id=dest_thread_id,
+                audio=file_id,
+                caption=caption,
+                reply_markup=kb,
+            )
 
     except Exception as e:
-        log.exception("Error enviando media group %s: %s", key, e)
-        await alert_error(context, f"media_group error: {e}")
+        log.warning("Audio caption-translate fallback (msg %s): %s", getattr(src_msg, "message_id", "?"), e)
+        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
 
 
 async def replicate_media_with_album_support(

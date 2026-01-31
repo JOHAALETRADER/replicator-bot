@@ -432,124 +432,82 @@ async def openai_tts(text_en: str) -> bytes:
 
 async def replicate_audio_with_translation(
     context: ContextTypes.DEFAULT_TYPE,
-    msg: Message,
+    src_msg: Message,
     dest_chat_id: int | str,
     dest_thread_id: Optional[int],
     *,
     do_translate: bool,
 ):
     """
-    Replica audios/voice al destino.
-    - Si do_translate=True y AUDIO_TRANSLATE=True: hace STT (OpenAI) -> traduce a inglés (DeepL)
-      y re-envía el **audio original sin cambiar la voz** como *Audio* con la traducción en el caption
-      (un solo mensaje, como en tu captura).
-    - Si no hay STT disponible o falla: re-envía el audio original sin caption (fallback seguro).
-    Nota: Telegram NO permite caption en "voice note" (msg.voice) cuando se hace copy_message;
-    por eso, cuando hay caption, lo re-subimos como Audio conservando los mismos bytes.
+    Si llega un audio/voice y la ruta es de traducción:
+      1) STT (OpenAI) -> texto ES
+      2) DeepL -> texto EN
+      3) TTS (OpenAI) -> audio EN
+      4) Enviar audio + texto EN (con botones traducidos si aplica)
     """
-    # Determinar qué media es
-    file_id = None
-    filename = "audio.ogg"
-    mime = "audio/ogg"
-
-    if getattr(msg, "voice", None):
-        file_id = msg.voice.file_id
-        filename = "voice.ogg"
-        mime = "audio/ogg"
-    elif getattr(msg, "audio", None):
-        file_id = msg.audio.file_id
-        filename = (msg.audio.file_name or "audio.mp3")
-        mime = (msg.audio.mime_type or "audio/mpeg")
-    elif getattr(msg, "document", None) and (getattr(msg.document, "mime_type", "") or "").startswith("audio/"):
-        file_id = msg.document.file_id
-        filename = (msg.document.file_name or "audio.bin")
-        mime = (msg.document.mime_type or "application/octet-stream")
-    else:
-        # No es un audio reconocible -> usar copia estándar
-        await context.bot.copy_message(
-            chat_id=dest_chat_id,
-            message_thread_id=dest_thread_id,
-            from_chat_id=msg.chat.id,
-            message_id=msg.message_id,
-        )
+    if not AUDIO_TRANSLATE or not do_translate:
+        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
         return
 
-    # Botones del mensaje original (opcional)
-    kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
-
-    # Si no toca traducir, copiamos tal cual (mantiene formato original)
-    if not (do_translate and TRANSLATE and AUDIO_TRANSLATE and OPENAI_API_KEY):
-        await context.bot.copy_message(
-            chat_id=dest_chat_id,
-            message_thread_id=dest_thread_id,
-            from_chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            reply_markup=kb,
-        )
+    # Solo audios sueltos (no álbum). Si viene en álbum, se mantiene como está.
+    if getattr(src_msg, "media_group_id", None):
+        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
         return
 
-    # Descargar bytes del audio original
-    try:
-        audio_bytes = await _download_file_bytes(context, file_id)
-    except Exception as e:
-        log.warning("Audio download failed (msg %s): %s", msg.message_id, e)
-        await context.bot.copy_message(
-            chat_id=dest_chat_id,
-            message_thread_id=dest_thread_id,
-            from_chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            reply_markup=kb,
-        )
+    audio_obj = getattr(src_msg, "voice", None) or getattr(src_msg, "audio", None)
+    if not audio_obj:
+        await replicate_media_with_album_support(context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate)
         return
 
-    # STT -> texto origen
-    transcript = ""
+    file_id = audio_obj.file_id
+    filename = getattr(audio_obj, "file_name", None) or ("voice.ogg" if getattr(src_msg, "voice", None) else "audio.mp3")
+    mime = getattr(audio_obj, "mime_type", None) or ("audio/ogg" if filename.endswith(".ogg") else "audio/mpeg")
+
+    # Descarga del audio desde Telegram
+    tg_file = await context.bot.get_file(file_id)
+    audio_bytes = bytes(await tg_file.download_as_bytearray())
+
+    # 1) STT
+    src_text = await openai_transcribe(audio_bytes, filename, mime, language_hint=SOURCE_LANG)
+
+    # 2) DeepL -> EN
+    timeout = aiohttp.ClientTimeout(total=45)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        text_en = await deepl_translate(src_text, session=session)
+
+    # 3) Enviar AUDIO ORIGINAL + caption traducido (SIN TTS)
+    # Nota: Telegram no permite caption en "voice note" (mensaje de voz). Para mantener audio original
+    # y pegar el texto en el mismo mensaje, lo enviamos como AUDIO con el mismo contenido.
+    cap = (text_en[:950] + "…") if len(text_en) > 950 else text_en
+    cap_html = html.escape(cap, quote=False) if cap else None
+
+    # Intentamos conservar reply_markup (botones) traducidos si existen
+    kb = await translate_buttons(src_msg.reply_markup, do_translate=True)
+
+    bio = io.BytesIO(file_bytes)
+    ext = os.path.splitext(file_path or "")[1].lower()
+    if not ext:
+        # fallback por tipo
+        ext = ".ogg" if is_voice else ".bin"
+    bio.name = f"audio_original{ext}"
+
+    sent_audio = await context.bot.send_audio(
+        chat_id=dest_chat_id,
+        message_thread_id=dest_thread_id,
+        audio=bio,
+        caption=cap_html,
+        parse_mode=ParseMode.HTML if cap_html else None,
+        reply_markup=kb,
+    )
+
+    # Guardar mapping para replies (si aplica y el destino es chat_id int)
     try:
-        transcript = (await _openai_stt(audio_bytes, filename=filename, mime=mime)).strip()
-    except Exception as e:
-        log.warning("Audio STT failed (msg %s): %s", msg.message_id, e)
-        transcript = ""
+        if isinstance(dest_chat_id, int):
+            db_save_map(int(src_msg.chat.id), int(src_msg.message_id), int(dest_chat_id), int(sent_audio.message_id))
+    except Exception:
+        pass
 
-    # Traducir a inglés (DeepL). Si no hay texto, solo re-enviamos audio.
-    caption_html = None
-    if transcript:
-        try:
-            text_en = await deepl_translate_simple(transcript)
-            text_en = (text_en or "").strip()
-            if text_en:
-                # Telegram caption límite ~1024 chars
-                if len(text_en) > 1000:
-                    text_en = text_en[:1000].rstrip() + "…"
-                caption_html = html.escape(text_en, quote=False)
-        except Exception as e:
-            log.warning("DeepL translate failed (msg %s): %s", msg.message_id, e)
-            caption_html = html.escape(transcript[:1000], quote=False)
-
-    # Enviar el AUDIO ORIGINAL (mismos bytes) como Audio con caption traducido (UN solo mensaje)
-    import io as _io
-    bio = _io.BytesIO(audio_bytes)
-    bio.name = filename
-
-    try:
-        sent = await context.bot.send_audio(
-            chat_id=dest_chat_id,
-            message_thread_id=dest_thread_id,
-            audio=bio,
-            caption=caption_html,
-            parse_mode=ParseMode.HTML if caption_html else None,
-            reply_markup=kb,
-        )
-        _save_map(msg.chat.id, msg.message_id, sent.chat.id, sent.message_id)
-    except Exception as e:
-        log.warning("send_audio failed (msg %s): %s", msg.message_id, e)
-        # Fallback: sin caption, como copia estándar
-        await context.bot.copy_message(
-            chat_id=dest_chat_id,
-            message_thread_id=dest_thread_id,
-            from_chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            reply_markup=kb,
-        )
+# ================== TRADUCCIÓN VISIBLE ==================
 async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
     frags = entities_to_html(text, entities or [])
     timeout = aiohttp.ClientTimeout(total=45)

@@ -466,8 +466,25 @@ async def replicate_audio_with_translation(
     if OPENAI_API_KEY:
         try:
             tg_file = await context.bot.get_file(file_id)
-            audio_bytes = await tg_file.download_as_bytearray()
-            transcript = await openai_transcribe(bytes(audio_bytes))
+            audio_bytes = bytes(await tg_file.download_as_bytearray())
+
+            filename = "audio.ogg"
+            mime = "audio/ogg"
+            language_hint = SOURCE_LANG or None
+            try:
+                if src_msg.voice:
+                    filename = "voice.ogg"
+                    mime = "audio/ogg"
+                elif src_msg.audio:
+                    filename = (src_msg.audio.file_name or "audio")
+                    mime = (src_msg.audio.mime_type or "audio/mpeg")
+                elif src_msg.document:
+                    filename = (getattr(src_msg.document, "file_name", None) or "audio")
+                    mime = (getattr(src_msg.document, "mime_type", None) or "application/octet-stream")
+            except Exception:
+                pass
+
+            transcript = await openai_transcribe(audio_bytes, filename, mime, language_hint=language_hint)
         except Exception as e:
             log.warning("Audio STT failed (msg %s): %s", src_msg.message_id, e)
             transcript = ""

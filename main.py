@@ -467,7 +467,7 @@ async def replicate_audio_with_translation(
         try:
             tg_file = await context.bot.get_file(file_id)
             audio_bytes = await tg_file.download_as_bytearray()
-            transcript = await openai_transcribe_audio(bytes(audio_bytes))
+            transcript = await openai_transcribe(bytes(audio_bytes))
         except Exception as e:
             log.warning("Audio STT failed (msg %s): %s", src_msg.message_id, e)
             transcript = ""

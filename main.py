@@ -1001,6 +1001,7 @@ async def replicate_message(
     dest_thread_id: Optional[int],
     *,
     do_translate: bool,
+    reply_to_override: Optional[int] = None,
 ):
     # Anti-loop interno: si ya es del bot, no repliques
     if is_from_bot(src_msg, context):
@@ -1009,6 +1010,8 @@ async def replicate_message(
     reply_to_id = None
     if isinstance(dest_chat_id, int):
         reply_to_id = resolve_reply_to_id(src_msg, dest_chat_id)
+    if reply_to_override is not None:
+        reply_to_id = reply_to_override
 
     
     # --- AUDIO: transcribir + traducir + reenviar como audio EN + texto EN ---
@@ -1260,6 +1263,16 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             try:
                 await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra)
+                # ✅ Extra: duplicar también como respuesta fija (mismo topic) para G1#129 -> G3#3
+                if chat.id == G1 and tid_norm == 129 and extra_chat == G3 and extra_thread == 3:
+                    await replicate_message(
+                        context,
+                        msg,
+                        extra_chat,
+                        extra_thread,
+                        do_translate=True,
+                        reply_to_override=6032,
+                    )
             except Exception as e:
                 log.warning("Fallo fanout %s#%s -> %s#%s: %s", chat.id, tid_norm, extra_chat, extra_thread, e)
                 await alert_error(context, f"Fanout fallo: {chat.id}#{tid_norm} -> {extra_chat}#{extra_thread}\n{e}")

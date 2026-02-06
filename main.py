@@ -2,6 +2,7 @@ import os
 import html
 import logging
 import re
+import unicodedata
 import asyncio
 import io
 import sqlite3
@@ -138,8 +139,6 @@ TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
 FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
     (G1, 2890): [(G3, 2), (G3, 4098)],
     (G1, 17373): [(G3, 2), (G3, 4098)],
-
-    # ✅ NUEVO: desde G1#129 también replicamos a G3#3 (ES) y G3#4096 (EN)
     (G1, 129): [(G3, 3), (G3, 4096)],
 }
 
@@ -148,9 +147,17 @@ NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
     # G1 → G3#2 en ES
     (G1, 2890, G3, 2),
     (G1, 17373, G3, 2),
-    (G1, 129, G3, 3),  # ✅ G1#129 → G3#3 sin traducción
-
+    (G1, 129, G3, 3),
 }
+
+# ================== REPLY FIJO PARA FANOUT (solo rutas específicas) ==================
+# Mapea (src_chat, src_thread, dst_chat, dst_thread) -> reply_to_message_id fijo en destino.
+# Nota: si el mensaje no existe, hacemos fallback a enviar sin reply (no rompe el flujo).
+FIXED_REPLY_TO: Dict[Tuple[int, int, int, int], int] = {
+    (G1, 129, G3, 3): 6033,       # ES → topic 3, reply al msg 6033
+    (G1, 129, G3, 4096): 6029,    # EN → topic 4096, reply al msg 6029
+}
+
 
 # ================== ANTI-LOOP: NO replicar desde destinos ==================
 DEST_TOPIC_SET: set[Tuple[int, int]] = set()
@@ -205,26 +212,6 @@ def probably_english(text: str) -> bool:
     return (len(ascii_letters) / max(1, len(letters))) > 0.85
 
 
-
-
-# ================== HIGIENE DE TEXTO (ANTI TRADUCCIONES RARAS) ==================
-_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
-_EMOJI_SPACING_RE = re.compile(r"([^\s])([🔥💥📊🤖📲🪙✍️↓✅❌])")
-
-def clean_for_translation(t: str) -> str:
-    if not t:
-        return t
-    t = _ZERO_WIDTH_RE.sub("", t)
-    t = _EMOJI_SPACING_RE.sub(r"\1 \2", t)
-    t = re.sub(r"[ \t]+", " ", t)
-    return t.strip()
-
-def postprocess_translation(t: str) -> str:
-    if not t:
-        return t
-    t = t.replace("to take them", "to take these trades")
-    t = t.replace("technical analysis to take", "technical analysis to trade")
-    return t
 # ================== ENTIDADES HTML ==================
 SAFE_TAGS = {"b", "strong", "i", "em", "u", "s", "del", "code", "pre", "a"}
 
@@ -366,7 +353,39 @@ async def deepl_create_glossary_if_needed() -> Optional[str]:
     except Exception as e:
         log.warning("DeepL glossary create failed: %s", e)
     return None
-# Limpieza mínima para evitar traducciones raras
+
+
+
+# ================== HIGIENE DE TEXTO PARA TRADUCCIÓN ==================
+_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
+_EMOJI_SPACING_RE = re.compile(r"([^\s])([🔥💥📊🤖📲🪙✍️↓✅❌])")
+
+def clean_for_translation(t: str) -> str:
+    if not t:
+        return t
+    # Normaliza unicode y elimina caracteres invisibles
+    t = unicodedata.normalize("NFKC", t)
+    t = _ZERO_WIDTH_RE.sub("", t)
+    # Separa emojis pegados a palabras (evita 'forsatechnical', etc.)
+    t = _EMOJI_SPACING_RE.sub(r"\\1 \\2", t)
+    # Compacta espacios
+    t = re.sub(r"[ \t]+", " ", t)
+    return t.strip()
+
+def postprocess_translation_en(t: str) -> str:
+    if not t:
+        return t
+    # Ajustes suaves para frases comunes sin reescribir todo
+    t = t.replace("to take them", "to take these trades")
+    t = t.replace("technical analysis to take", "technical analysis to trade")
+    return t
+
+
+async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
+    if not text.strip():
+        return text
+    if not TRANSLATE or not DEEPL_API_KEY:
+        return text
     text = clean_for_translation(text)
     # ✅ opción A: si ya es inglés y no forzamos, se deja tal cual
     if not FORCE_TRANSLATE and probably_english(text):
@@ -398,7 +417,7 @@ async def deepl_create_glossary_if_needed() -> Optional[str]:
             return text
         js = await r.json()
         out = js["translations"][0]["text"]
-        return postprocess_translation(out)
+        return postprocess_translation_en(out)
 
 # ================== OPENAI STT/TTS (AUDIO) ==================
 async def openai_transcribe(audio_bytes: bytes, filename: str, mime: str, *, language_hint: str) -> str:
@@ -985,23 +1004,15 @@ async def replicate_media_with_album_support(
     dest_thread_id: Optional[int],
     *,
     do_translate: bool,
+    forced_reply_to_message_id: Optional[int] = None,
 ):
     mgid = getattr(src_msg, "media_group_id", None)
     if not mgid:
-        reply_to_id = resolve_reply_to_id(src_msg, int(dest_chat_id)) if isinstance(dest_chat_id, int) else None
-        try:
-            sent = await copy_with_caption(
-                context, dest_chat_id, dest_thread_id, src_msg,
-                do_translate=do_translate, reply_to_message_id=reply_to_id
-            )
-        except Exception as e:
-            if reply_to_id is not None and "Message to be replied not found" in str(e):
-                sent = await copy_with_caption(
-                    context, dest_chat_id, dest_thread_id, src_msg,
-                    do_translate=do_translate, reply_to_message_id=None
-                )
-            else:
-                raise
+        reply_to_id = forced_reply_to_message_id if forced_reply_to_message_id is not None else (resolve_reply_to_id(src_msg, int(dest_chat_id)) if isinstance(dest_chat_id, int) else None)
+        sent = await copy_with_caption(
+            context, dest_chat_id, dest_thread_id, src_msg,
+            do_translate=do_translate, reply_to_message_id=reply_to_id
+        )
         if sent and isinstance(dest_chat_id, int):
             db_save_map(src_msg.chat.id, src_msg.message_id, int(dest_chat_id), sent.message_id)
         return
@@ -1027,17 +1038,15 @@ async def replicate_message(
     dest_thread_id: Optional[int],
     *,
     do_translate: bool,
-    reply_to_override: Optional[int] = None,
+    forced_reply_to_message_id: Optional[int] = None,
 ):
     # Anti-loop interno: si ya es del bot, no repliques
     if is_from_bot(src_msg, context):
         return
 
-    reply_to_id = None
-    if isinstance(dest_chat_id, int):
+    reply_to_id = forced_reply_to_message_id
+    if reply_to_id is None and isinstance(dest_chat_id, int):
         reply_to_id = resolve_reply_to_id(src_msg, dest_chat_id)
-    if reply_to_override is not None:
-        reply_to_id = reply_to_override
 
     
     # --- AUDIO: transcribir + traducir + reenviar como audio EN + texto EN ---
@@ -1049,26 +1058,16 @@ async def replicate_message(
             # Si falla STT/TTS, hacemos fallback al comportamiento original (copiar audio)
             log.warning("Audio translate fallback (msg %s): %s", src_msg.message_id, e)
     if src_msg.text:
-        try:
-            sent = await send_text(
-                context, dest_chat_id, dest_thread_id, src_msg,
-                do_translate=do_translate, reply_to_message_id=reply_to_id
-            )
-        except Exception as e:
-            # Si el reply target no existe, reintenta sin reply (para no romper el flujo)
-            if reply_to_id is not None and "Message to be replied not found" in str(e):
-                sent = await send_text(
-                    context, dest_chat_id, dest_thread_id, src_msg,
-                    do_translate=do_translate, reply_to_message_id=None
-                )
-            else:
-                raise
+        sent = await send_text(
+            context, dest_chat_id, dest_thread_id, src_msg,
+            do_translate=do_translate, reply_to_message_id=reply_to_id
+        )
         if sent and isinstance(dest_chat_id, int):
             db_save_map(src_msg.chat.id, src_msg.message_id, dest_chat_id, sent.message_id)
         return
 
     await replicate_media_with_album_support(
-        context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate
+        context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate, forced_reply_to_message_id=reply_to_id
     )
 
     mgid = getattr(src_msg, "media_group_id", None)
@@ -1082,32 +1081,17 @@ async def replicate_message(
         else:
             cap_html = build_html_no_translate(cap_text, cap_entities)
         cap_html = cap_with_prefix(pref, cap_html, max_len=3500)
-        try:
-            await call_with_retry(
-                "reply_album_caption",
-                lambda: context.bot.send_message(
-                    chat_id=dest_chat_id,
-                    message_thread_id=dest_thread_id,
-                    text=cap_html,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    reply_to_message_id=reply_to_id,
-                )
+        await call_with_retry(
+            "reply_album_caption",
+            lambda: context.bot.send_message(
+                chat_id=dest_chat_id,
+                message_thread_id=dest_thread_id,
+                text=cap_html,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_to_message_id=reply_to_id,
             )
-        except Exception as e:
-            if reply_to_id is not None and "Message to be replied not found" in str(e):
-                await call_with_retry(
-                    "reply_album_caption_fallback",
-                    lambda: context.bot.send_message(
-                        chat_id=dest_chat_id,
-                        message_thread_id=dest_thread_id,
-                        text=cap_html,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                )
-            else:
-                raise
+        )
 
 
 # ================== EDICIONES (AUTO SYNC) ==================
@@ -1313,34 +1297,18 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg.message_id,
             )
             try:
-                # ✅ Reglas especiales SOLO para G1#129 (no tocar otros flujos)
-                if chat.id == G1 and tid_norm == 129 and extra_chat == G3:
-                    # A) G3#3 en español, como respuesta al mensaje 6033
-                    if extra_thread == 3:
-                        await replicate_message(
-                            context,
-                            msg,
-                            extra_chat,
-                            extra_thread,
-                            do_translate=False,
-                            reply_to_override=6033,
-                        )
-                        continue
+                reply_fixed = None
+                if isinstance(extra_chat, int):
+                    reply_fixed = FIXED_REPLY_TO.get((chat.id, tid_norm, int(extra_chat), int(extra_thread)))
+                try:
+                    await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra, forced_reply_to_message_id=reply_fixed)
+                except BadRequest as be:
+                    if reply_fixed is not None and 'Message to be replied not found' in str(be):
+                        # Fallback: enviar sin reply fijo
+                        await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra, forced_reply_to_message_id=None)
+                    else:
+                        raise
 
-                    # B) G3#4096 en inglés, como respuesta al mensaje 6029
-                    if extra_thread == 4096:
-                        await replicate_message(
-                            context,
-                            msg,
-                            extra_chat,
-                            extra_thread,
-                            do_translate=True,
-                            reply_to_override=6029,
-                        )
-                        continue
-
-                # Default fanout (igual que antes)
-                await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra)
             except Exception as e:
                 log.warning("Fallo fanout %s#%s -> %s#%s: %s", chat.id, tid_norm, extra_chat, extra_thread, e)
                 await alert_error(context, f"Fanout fallo: {chat.id}#{tid_norm} -> {extra_chat}#{extra_thread}\n{e}")

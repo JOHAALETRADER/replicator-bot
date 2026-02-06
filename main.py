@@ -366,9 +366,7 @@ async def deepl_create_glossary_if_needed() -> Optional[str]:
     except Exception as e:
         log.warning("DeepL glossary create failed: %s", e)
     return None
-
-
-\1    # Limpieza mínima para evitar traducciones raras
+# Limpieza mínima para evitar traducciones raras
     text = clean_for_translation(text)
     # ✅ opción A: si ya es inglés y no forzamos, se deja tal cual
     if not FORCE_TRANSLATE and probably_english(text):

@@ -358,236 +358,77 @@ _ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
 _EMOJI_SPACING_RE = re.compile(r"([^\s])([🔥💥📊🤖📲🪙✍️↓✅❌])")
 
 def clean_for_translation(t: str) -> str:
+    """
+    Limpieza *suave* antes de DeepL para evitar artefactos (palabras pegadas, emojis unidos,
+    caracteres invisibles). No toca enlaces ni estructura del mensaje.
+    """
     if not t:
         return t
+
     # Normaliza unicode y elimina caracteres invisibles
     t = unicodedata.normalize("NFKC", t)
     t = _ZERO_WIDTH_RE.sub("", t)
-    # Separa emojis pegados a palabras (evita 'forsatechnical', etc.)
-    t = _EMOJI_SPACING_RE.sub(r"\1 \2", t)
+
+    # Protege URLs para no "partirlas" al separar emojis/símbolos
+    url_map = {}
+    def _url_repl(m):
+        key = f"__URL{len(url_map)}__"
+        url_map[key] = m.group(0)
+        return key
+
+    t = re.sub(r"https?://\S+|t\.me/\S+", _url_repl, t)
+
+    # Separa emojis pegados a palabras (evita 'forsatechnical', '❤️MaSee', etc.)
+    # Rango emoji más común + símbolos varios usados en copy
+    emoji_chars = r"\U0001F300-\U0001FAFF\u2600-\u27BF"
+    t = re.sub(rf"(\w)([{emoji_chars}])", r"\1 \2", t)
+    t = re.sub(rf"([{emoji_chars}])(\w)", r"\1 \2", t)
+
     # Compacta espacios
-    t = re.sub(r"[ \t]+", " ", t)
-    return t.strip()
+    t = re.sub(r"[ \t]+", " ", t).strip()
+
+    # Restaura URLs
+    for k, v in url_map.items():
+        t = t.replace(k, v)
+
+    return t
+
 
 def postprocess_translation_en(t: str) -> str:
+    """
+    Pulido mínimo para que el inglés suene natural en contexto trading/comunidad,
+    sin reescribir el mensaje ni alterar el sentido.
+    """
     if not t:
         return t
 
     # 1) Limpia artefactos raros si alguna vez aparecen
-    # (Esto evita que salgan literales como '\\1' o '\\2' en el texto final)
     t = t.replace("\\1", "").replace("\\2", "")
 
-    # 2) Ajustes suaves para frases comunes sin reescribir todo
-    t = t.replace("to take them", "to take these trades")
-    t = t.replace("technical analysis to take", "technical analysis to trade")
-
-    # 3) Naturalidad para copy de comunidad / lives (trading)
+    # 2) Naturalidad para lives (trading)
     # DeepL a veces traduce 'conectarme al live' como 'connect to live'
     t = re.sub(r"\bconnect to (the )?live\b", "go live", t, flags=re.IGNORECASE)
 
-    # 4) Typos frecuentes si el input viene con ruido
-    t = re.sub(r"\bGhank\b", "Thank", t)
+    # 3) Frases comunes: hacerlas más naturales
+    t = re.sub(r"\bwithout fail\b", "for sure", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bwith all the energy to continue growing together on this path\b",
+               "with full energy to keep growing together", t, flags=re.IGNORECASE)
 
-    # 5) Compacta espacios
+    # 4) Ajustes suaves adicionales (sin cambiar contenido)
+    t = t.replace("to take them", "to take these trades")
+    t = t.replace("technical analysis to take", "technical analysis to trade")
+
+    # 5) Typos frecuentes si el input viene con ruido
+    t = re.sub(r"\bGhank\b", "Thank", t)
+    t = re.sub(r"\bMaSee\b", "See", t)
+
+    # 6) Espaciado alrededor de corazones y emojis comunes (por si queda alguno pegado)
+    t = re.sub(r"([A-Za-z])([❤️🔥📈🙏💻⚡])", r"\1 \2", t)
+    t = re.sub(r"([❤️🔥📈🙏💻⚡])([A-Za-z])", r"\1 \2", t)
+
+    # 7) Compacta espacios
     t = re.sub(r"[ \t]{2,}", " ", t).strip()
     return t
-
-
-
-async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
-    if not text.strip():
-        return text
-    if not TRANSLATE or not DEEPL_API_KEY:
-        return text
-    text = clean_for_translation(text)
-    # ✅ opción A: si ya es inglés y no forzamos, se deja tal cual
-    if not FORCE_TRANSLATE and probably_english(text):
-        return text
-
-    gid = _glossary_id_mem or GLOSSARY_ID or ""
-    if not gid and (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV):
-        try:
-            gid = await deepl_create_glossary_if_needed() or ""
-        except Exception:
-            gid = ""
-
-    url = f"https://{DEEPL_API_HOST}/v2/translate"
-    data = {
-        "auth_key": DEEPL_API_KEY,
-        "text": text,
-        "source_lang": SOURCE_LANG,
-        "target_lang": TARGET_LANG,
-    }
-    if TARGET_LANG in DEEPL_FORMALITY_LANGS:
-        data["formality"] = FORMALITY
-    if gid:
-        data["glossary_id"] = gid
-
-    async with session.post(url, data=data) as r:
-        b = await r.text()
-        if r.status != 200:
-            log.warning("DeepL HTTP %s: %s", r.status, b)
-            return text
-        js = await r.json()
-        out = js["translations"][0]["text"]
-        return postprocess_translation_en(out)
-
-# ================== OPENAI STT/TTS (AUDIO) ==================
-async def openai_transcribe(audio_bytes: bytes, filename: str, mime: str, *, language_hint: str) -> str:
-    """
-    Speech-to-text con OpenAI (Whisper). Devuelve texto en el idioma original.
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Falta OPENAI_API_KEY para transcribir audio.")
-    url = f"{OPENAI_BASE_URL}/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-
-    form = aiohttp.FormData()
-    form.add_field("model", OPENAI_STT_MODEL)
-    # Whisper usa language como 'es', 'en', etc. (mejor esfuerzo)
-    if language_hint:
-        form.add_field("language", language_hint.lower())
-    form.add_field("file", audio_bytes, filename=filename, content_type=mime or "application/octet-stream")
-
-    timeout = aiohttp.ClientTimeout(total=OPENAI_TIMEOUT_SEC)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, headers=headers, data=form) as resp:
-            body = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"OpenAI STT HTTP {resp.status}: {body[:400]}")
-            js = await resp.json()
-            return (js.get("text") or "").strip()
-
-async def openai_tts(text_en: str) -> bytes:
-    """
-    Text-to-speech con OpenAI. Devuelve bytes de audio (mp3 por defecto).
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Falta OPENAI_API_KEY para generar audio (TTS).")
-    if not text_en.strip():
-        return b""
-    url = f"{OPENAI_BASE_URL}/audio/speech"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": OPENAI_TTS_MODEL,
-        "voice": OPENAI_TTS_VOICE,
-        "input": text_en,
-        "format": OPENAI_TTS_FORMAT,
-}
-
-    timeout = aiohttp.ClientTimeout(total=OPENAI_TIMEOUT_SEC)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"OpenAI TTS HTTP {resp.status}: {body[:400]}")
-            return await resp.read()
-
-async def replicate_audio_with_translation(
-    context: ContextTypes.DEFAULT_TYPE,
-    src_msg: Message,
-    dest_chat_id: int | str,
-    dest_thread_id: Optional[int],
-    *,
-    do_translate: bool,
-):
-    """
-    Ajuste: NO traducimos la voz (no TTS).
-    - Enviamos el audio/nota de voz ORIGINAL al destino.
-    - Pegado al audio (caption) enviamos el TEXTO traducido a inglés (STT + DeepL).
-    Si falla STT o no hay OPENAI_API_KEY, se replica el audio original sin caption.
-    """
-    # Si está apagado el audio-translate o no corresponde traducir, solo copiamos el audio original.
-    if not AUDIO_TRANSLATE or not do_translate:
-        await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=False)
-        return
-
-    file_id = None
-    is_voice = False
-    if getattr(src_msg, "voice", None):
-        file_id = src_msg.voice.file_id
-        is_voice = True
-    elif getattr(src_msg, "audio", None):
-        file_id = src_msg.audio.file_id
-        is_voice = False
-
-    if not file_id:
-        await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=do_translate)
-        return
-
-    transcript = ""
-    if OPENAI_API_KEY:
-        try:
-            tg_file = await context.bot.get_file(file_id)
-            audio_bytes = bytes(await tg_file.download_as_bytearray())
-
-            filename = "audio.ogg"
-            mime = "audio/ogg"
-            language_hint = SOURCE_LANG or None
-            try:
-                if src_msg.voice:
-                    filename = "voice.ogg"
-                    mime = "audio/ogg"
-                elif src_msg.audio:
-                    filename = (src_msg.audio.file_name or "audio")
-                    mime = (src_msg.audio.mime_type or "audio/mpeg")
-                elif src_msg.document:
-                    filename = (getattr(src_msg.document, "file_name", None) or "audio")
-                    mime = (getattr(src_msg.document, "mime_type", None) or "application/octet-stream")
-            except Exception:
-                pass
-
-            transcript = await openai_transcribe(audio_bytes, filename, mime, language_hint=language_hint)
-        except Exception as e:
-            log.warning("Audio STT failed (msg %s): %s", src_msg.message_id, e)
-            transcript = ""
-
-    caption_text = ""
-    if transcript.strip():
-        try:
-            timeout = aiohttp.ClientTimeout(total=45)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                caption_text = await deepl_translate(transcript.strip(), session=session)
-        except Exception as e:
-            log.warning("Audio translate text failed (msg %s): %s", src_msg.message_id, e)
-            caption_text = ""
-
-    try:
-        kb = await translate_buttons(src_msg.reply_markup, do_translate=TRANSLATE_BUTTONS and do_translate)
-        if is_voice:
-            await context.bot.send_voice(
-                chat_id=dest_chat_id,
-                message_thread_id=dest_thread_id,
-                voice=file_id,
-                caption=(caption_text[:1024] if caption_text else None),
-                reply_markup=kb,
-            )
-        else:
-            await context.bot.send_audio(
-                chat_id=dest_chat_id,
-                message_thread_id=dest_thread_id,
-                audio=file_id,
-                caption=(caption_text[:1024] if caption_text else None),
-                reply_markup=kb,
-            )
-    except Exception as e:
-        log.warning("Audio send with caption failed (msg %s): %s. Falling back to copy_message.", src_msg.message_id, e)
-        await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=False)
-    return
-# ================== TRADUCCIÓN VISIBLE ==================
-async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
-    frags = entities_to_html(text, entities or [])
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        new_frags: List[Tuple[str, Dict[str, Any]]] = []
-        for frag, meta in frags:
-            if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
-                new_text = await deepl_translate(frag, session=session)
-                new_frags.append((new_text, meta))
-            else:
-                new_frags.append((frag, meta))
-    html_text = build_html(new_frags)
-    return html_text, []
 
 
 def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:

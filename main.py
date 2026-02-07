@@ -247,6 +247,11 @@ def postprocess_translation(text: str, placeholders: dict) -> str:
     # Ajustes mínimos para inglés más natural (trading/community)
     t = re.sub(r"\bconnect to live\b", "go live", t, flags=re.I)
     t = re.sub(r"\bcontinue growing together on this path\b", "keep growing together on this journey", t, flags=re.I)
+    # Arreglos anti-mezcla ES->EN (conectores típicos que a veces quedan sin traducir)
+    t = re.sub(r"\bMattersnte\s*:", "Important:", t, flags=re.I)
+    t = re.sub(r"\bpara\s+that\b", "so that", t, flags=re.I)
+    t = re.sub(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", r"for \1", t, flags=re.I)
+    t = re.sub(r"\bpor\s+patience\b", "for your patience", t, flags=re.I)
     # Normalizar espacios
     t = re.sub(r"[ \t]+", " ", t).strip()
     return t
@@ -426,6 +431,9 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
             gid = ""
 
     text2, _url_ph = preprocess_for_translation(text)
+    # Extra: ayuda a DeepL con encabezados típicos para evitar salidas raras
+    if TARGET_LANG.upper() == 'EN':
+        text2 = re.sub(r'^\s*Importante\s*:', 'Important:', text2, flags=re.I|re.M)
 
     url = f"https://{DEEPL_API_HOST}/v2/translate"
     data = {

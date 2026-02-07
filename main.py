@@ -153,9 +153,7 @@ NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
 # ================== REPLY FIJO PARA FANOUT (solo rutas específicas) ==================
 # Mapea (src_chat, src_thread, dst_chat, dst_thread) -> reply_to_message_id fijo en destino.
 # Nota: si el mensaje no existe, hacemos fallback a enviar sin reply (no rompe el flujo).
-FIXED_REPLY_TO: Dict[Tuple[int, int, int, int], int] = {
-    (G1, 129, G3, 3): 6033,       # ES → topic 3, reply al msg 6033
-}
+FIXED_REPLY_TO: Dict[Tuple[int, int, int, int], int] = {}
 
 
 # ================== ANTI-LOOP: NO replicar desde destinos ==================
@@ -1042,9 +1040,11 @@ async def replicate_message(
     # Anti-loop interno: si ya es del bot, no repliques
     if is_from_bot(src_msg, context):
         return
-
-    reply_to_id = forced_reply_to_message_id
-    if reply_to_id is None and isinstance(dest_chat_id, int):
+    # forced_reply_to_message_id:
+    #   None -> normal behavior (may map replies)
+    #   0    -> explicitly disable replying in destination
+    reply_to_id = None if forced_reply_to_message_id == 0 else forced_reply_to_message_id
+    if reply_to_id is None and forced_reply_to_message_id != 0 and isinstance(dest_chat_id, int):
         reply_to_id = resolve_reply_to_id(src_msg, dest_chat_id)
 
     
@@ -1277,7 +1277,7 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            await replicate_message(context, msg, dst_chat, dst_thread, do_translate=do_translate_main)
+            await replicate_message(context, msg, dst_chat, dst_thread, do_translate=do_translate_main, forced_reply_to_message_id=(0 if (chat.id == G1 and tid_norm == 129) else None))
         except Exception as e:
             log.warning("Fallo ruta principal %s#%s -> %s#%s: %s", chat.id, thread_id, dst_chat, dst_thread, e)
             await alert_error(context, f"Ruta principal fallo: {chat.id}#{thread_id} -> {dst_chat}#{dst_thread}\n{e}")
@@ -1300,11 +1300,11 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if isinstance(extra_chat, int):
                     reply_fixed = FIXED_REPLY_TO.get((chat.id, tid_norm, int(extra_chat), int(extra_thread)))
                 try:
-                    await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra, forced_reply_to_message_id=reply_fixed)
+                    await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra, forced_reply_to_message_id=(0 if (chat.id == G1 and tid_norm == 129) else reply_fixed))
                 except BadRequest as be:
                     if reply_fixed is not None and 'Message to be replied not found' in str(be):
                         # Fallback: enviar sin reply fijo
-                        await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra, forced_reply_to_message_id=None)
+                        await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra, forced_reply_to_message_id=(0 if (chat.id == G1 and tid_norm == 129) else None))
                     else:
                         raise
 

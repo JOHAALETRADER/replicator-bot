@@ -2,7 +2,6 @@ import os
 import html
 import logging
 import re
-import unicodedata
 import asyncio
 import io
 import sqlite3
@@ -137,24 +136,18 @@ TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
 
 # ================== FAN-OUT OPCIONAL ==================
 FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
+    (G1, 129): [(G3, 3), (G3, 4096)],
     (G1, 2890): [(G3, 2), (G3, 4098)],
     (G1, 17373): [(G3, 2), (G3, 4098)],
-    (G1, 129): [(G3, 3), (G3, 4096)],
 }
 
 # ================== OVERRIDE DE TRADUCCIÓN POR RUTA ==================
 NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
     # G1 → G3#2 en ES
     (G1, 2890, G3, 2),
-    (G1, 17373, G3, 2),
-    (G1, 129, G3, 3),
+    (G1, 17373, G3, 2),    (G1, 129, G3, 3),
+
 }
-
-# ================== REPLY FIJO PARA FANOUT (solo rutas específicas) ==================
-# Mapea (src_chat, src_thread, dst_chat, dst_thread) -> reply_to_message_id fijo en destino.
-# Nota: si el mensaje no existe, hacemos fallback a enviar sin reply (no rompe el flujo).
-FIXED_REPLY_TO: Dict[Tuple[int, int, int, int], int] = {}
-
 
 # ================== ANTI-LOOP: NO replicar desde destinos ==================
 DEST_TOPIC_SET: set[Tuple[int, int]] = set()
@@ -198,16 +191,79 @@ _ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|co
 
 
 def probably_english(text: str) -> bool:
-    if _ES_MARKERS.search(text):
+    """Heurística conservadora: solo 'no traducir' si es claramente inglés.
+    Evita falsos positivos en textos de trading (mezcla ES/EN, emojis, links)."""
+    t = (text or "").strip()
+    if not t:
         return False
-    if _EN_COMMON.search(text):
+    # Si hay marcadores de español, NO es inglés.
+    if _ES_MARKERS.search(t):
+        return False
+
+    # Cuenta palabras comunes en inglés. Exige varias coincidencias para considerarlo inglés.
+    en_hits = len(_EN_COMMON.findall(t))
+    if en_hits >= 4 and len(t) >= 40:
         return True
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
+
+    # Ratio de letras ASCII: también exige longitud suficiente.
+    letters = [c for c in t if c.isalpha()]
+    if len(letters) < 20:
         return False
     ascii_letters = [c for c in letters if ord(c) < 128]
-    return (len(ascii_letters) / max(1, len(letters))) > 0.85
+    return (len(ascii_letters) / max(1, len(letters))) > 0.95
 
+
+# ================== PRE/POST PROCESO DE TRADUCCIÓN ==================
+_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
+_URL_RE = re.compile(r"(https?://\S+|tg://\S+)", re.I)
+
+# Emojis comunes de tu comunidad (evita pegados raros)
+_EMOJI_CHARS = "❤️🔥📈🙏💻⚡📊🚀💯😎👀🤖😅✅❌👉👇⬇️⬆️⭐✨🎯💸📉🧠🖥️"
+_EMOJI_EDGE_RE = re.compile(rf"(\w)([{re.escape(_EMOJI_CHARS)}])|([{re.escape(_EMOJI_CHARS)}])(\w)")
+
+def _normalize_for_translation(text: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKC", text or "")
+    t = _ZERO_WIDTH_RE.sub("", t)
+    # Asegura espacios alrededor de emojis comunes
+    def _space_em(m: re.Match) -> str:
+        if m.group(1) and m.group(2):
+            return f"{m.group(1)} {m.group(2)}"
+        if m.group(3) and m.group(4):
+            return f"{m.group(3)} {m.group(4)}"
+        return m.group(0)
+    t = _EMOJI_EDGE_RE.sub(_space_em, t)
+    # Compacta espacios
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+def _protect_urls(text: str) -> tuple[str, list[str]]:
+    urls: list[str] = []
+    def _repl(m: re.Match) -> str:
+        urls.append(m.group(0))
+        return f"__URL{len(urls)-1}__"
+    return _URL_RE.sub(_repl, text), urls
+
+def _restore_urls(text: str, urls: list[str]) -> str:
+    out = text
+    for i, u in enumerate(urls):
+        out = out.replace(f"__URL{i}__", u)
+    return out
+
+def _postprocess_en(text: str) -> str:
+    t = (text or "")
+    # Elimina artefactos típicos si llegaran a colarse
+    t = t.replace("\\1", "").replace("\\2", "")
+    t = t.replace("Ghank", "Thank").replace("ghank", "thank")
+    t = t.replace("MaSee", "See").replace("maSee", "see")
+    # Frases naturales para tu contexto
+    t = t.replace("connect to live", "go live")
+    t = t.replace("connect to the live", "go live")
+    t = t.replace("I will not be able to go live today.", "I won’t be going live today.")
+    t = t.replace("I will not be able to go live today", "I won’t be going live today")
+    # Limpieza final de espacios
+    t = re.sub(r"[ \t]{2,}", " ", t).strip()
+    return t
 
 # ================== ENTIDADES HTML ==================
 SAFE_TAGS = {"b", "strong", "i", "em", "u", "s", "del", "code", "pre", "a"}
@@ -352,80 +408,23 @@ async def deepl_create_glossary_if_needed() -> Optional[str]:
     return None
 
 
-
-# ================== HIGIENE DE TEXTO PARA TRADUCCIÓN ==================
-_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
-_EMOJI_SPACING_RE = re.compile(r"([^\s])([🔥💥📊🤖📲🪙✍️↓✅❌❤️📈🙏💻⚡➡️⬇️⏳])")
-
-def clean_for_translation(t: str) -> str:
-    """
-    Limpieza mínima y segura antes de enviar a DeepL.
-    Evita artefactos, emojis pegados y caracteres invisibles sin alterar enlaces.
-    """
-    if not t:
-        return t
-
-    # Normaliza unicode y elimina caracteres invisibles
-    t = unicodedata.normalize("NFKC", t)
-    t = _ZERO_WIDTH_RE.sub("", t)
-
-    # Protege URLs para no tocarlas durante separación de emojis/espacios
-    urls: List[str] = []
-    def _url_sub(m: re.Match) -> str:
-        urls.append(m.group(0))
-        return "__URL%d__" % (len(urls) - 1)
-    t = re.sub(r"https?://\S+", _url_sub, t)
-
-    # Separa emojis pegados a palabras (IMPORTANTE: \1 y \2, no \\1)
-    t = _EMOJI_SPACING_RE.sub(r"\1 \2", t)
-
-    # Restaura URLs
-    for i, u in enumerate(urls):
-        t = t.replace("__URL%d__" % i, u)
-
-    # Compacta espacios
-    t = re.sub(r"[ \t]+", " ", t)
-    return t.strip()
-def postprocess_translation_en(t: str) -> str:
-    """
-    Ajustes suaves post-DeepL para inglés natural en comunidad trading
-    y para eliminar artefactos típicos.
-    """
-    if not t:
-        return t
-
-    # Elimina artefactos de regex si llegaran a colarse
-    t = t.replace("\\1", "").replace("\\2", "")
-    t = t.replace("\1", "").replace("\2", "")
-
-    # Naturalidad
-    t = t.replace("connect to live", "go live")
-
-    # Palabras corruptas observadas
-    t = re.sub(r"\bGhank\b", "Thank", t)
-    t = re.sub(r"\bMaSee\b", "See", t)
-    t = re.sub(r"\bareñates\b", "signals", t, flags=re.IGNORECASE)
-    t = re.sub(r"\bforsatechnical\b", "for technical", t, flags=re.IGNORECASE)
-
-    # Ajustes suaves de frases
-    t = t.replace("to take them", "to use them")
-    t = t.replace("technical analysis to take", "technical analysis to use")
-    t = t.replace("continue growing together on this path", "keep growing together on this journey")
-
-    # Limpia dobles espacios y separa emojis si quedaron pegados
-    t = re.sub(r"[ \t]+", " ", t)
-    t = _EMOJI_SPACING_RE.sub(r"\1 \2", t)
-
-    return t.strip()
 async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
-    if not text.strip():
-        return text
+    """Traduce con DeepL con limpieza previa y post-proceso suave.
+    Si DeepL falla, devuelve el texto original (para que NUNCA se caiga la réplica)."""
+    raw = text or ""
+    if not raw.strip():
+        return raw
     if not TRANSLATE or not DEEPL_API_KEY:
-        return text
-    text = clean_for_translation(text)
-    # ✅ opción A: si ya es inglés y no forzamos, se deja tal cual
-    if not FORCE_TRANSLATE and probably_english(text):
-        return text
+        return raw
+
+    clean = _normalize_for_translation(raw)
+
+    # Si no forzamos y es claramente inglés, no traducimos.
+    if not FORCE_TRANSLATE and probably_english(clean):
+        return clean
+
+    # Protege URLs para que DeepL no las “rompa”
+    protected, urls = _protect_urls(clean)
 
     gid = _glossary_id_mem or GLOSSARY_ID or ""
     if not gid and (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV):
@@ -437,7 +436,7 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
     url = f"https://{DEEPL_API_HOST}/v2/translate"
     data = {
         "auth_key": DEEPL_API_KEY,
-        "text": text,
+        "text": protected,
         "source_lang": SOURCE_LANG,
         "target_lang": TARGET_LANG,
     }
@@ -446,14 +445,25 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
     if gid:
         data["glossary_id"] = gid
 
-    async with session.post(url, data=data) as r:
-        b = await r.text()
-        if r.status != 200:
-            log.warning("DeepL HTTP %s: %s", r.status, b)
-            return text
-        js = await r.json()
-        out = js["translations"][0]["text"]
-        return postprocess_translation_en(out)
+    try:
+        async with session.post(url, data=data) as r:
+            if r.status != 200:
+                b = await r.text()
+                log.warning("DeepL HTTP %s: %s", r.status, b)
+                return clean
+            js = await r.json()
+            out = js["translations"][0]["text"]
+    except Exception as e:
+        log.warning("DeepL exception: %s", e)
+        return clean
+
+    out = _restore_urls(out, urls)
+
+    # Post-proceso SOLO para inglés objetivo
+    if (TARGET_LANG or "").upper().startswith("EN"):
+        out = _postprocess_en(out)
+
+    return out
 
 # ================== OPENAI STT/TTS (AUDIO) ==================
 async def openai_transcribe(audio_bytes: bytes, filename: str, mime: str, *, language_hint: str) -> str:
@@ -496,7 +506,7 @@ async def openai_tts(text_en: str) -> bytes:
         "voice": OPENAI_TTS_VOICE,
         "input": text_en,
         "format": OPENAI_TTS_FORMAT,
-}
+    }
 
     timeout = aiohttp.ClientTimeout(total=OPENAI_TIMEOUT_SEC)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -599,18 +609,30 @@ async def replicate_audio_with_translation(
     return
 # ================== TRADUCCIÓN VISIBLE ==================
 async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
-    frags = entities_to_html(text, entities or [])
+    """Traduce el mensaje completo preservando formato básico (HTML).
+    Evita traducciones fragmentadas que mezclan ES/EN."""
+    # Construye HTML seguro desde entidades
+    frags = entities_to_html(text or "", entities or [])
+    html_src = build_html(frags)
+
+    # Protege tags HTML para que DeepL no los toque
+    tags: list[str] = []
+    def _tag_repl(m: re.Match) -> str:
+        tags.append(m.group(0))
+        return f"__TAG{len(tags)-1}__"
+
+    protected = re.sub(r"</?[^>]+>", _tag_repl, html_src)
+
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        new_frags: List[Tuple[str, Dict[str, Any]]] = []
-        for frag, meta in frags:
-            if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
-                new_text = await deepl_translate(frag, session=session)
-                new_frags.append((new_text, meta))
-            else:
-                new_frags.append((frag, meta))
-    html_text = build_html(new_frags)
-    return html_text, []
+        translated = await deepl_translate(protected, session=session)
+
+    # Restaura tags
+    out = translated
+    for i, tag in enumerate(tags):
+        out = out.replace(f"__TAG{i}__", tag)
+
+    return out, []
 
 
 def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
@@ -1040,11 +1062,10 @@ async def replicate_media_with_album_support(
     dest_thread_id: Optional[int],
     *,
     do_translate: bool,
-    forced_reply_to_message_id: Optional[int] = None,
 ):
     mgid = getattr(src_msg, "media_group_id", None)
     if not mgid:
-        reply_to_id = forced_reply_to_message_id if forced_reply_to_message_id is not None else (resolve_reply_to_id(src_msg, int(dest_chat_id)) if isinstance(dest_chat_id, int) else None)
+        reply_to_id = resolve_reply_to_id(src_msg, int(dest_chat_id)) if isinstance(dest_chat_id, int) else None
         sent = await copy_with_caption(
             context, dest_chat_id, dest_thread_id, src_msg,
             do_translate=do_translate, reply_to_message_id=reply_to_id
@@ -1074,19 +1095,29 @@ async def replicate_message(
     dest_thread_id: Optional[int],
     *,
     do_translate: bool,
-    forced_reply_to_message_id: Optional[int] = None,
 ):
     # Anti-loop interno: si ya es del bot, no repliques
     if is_from_bot(src_msg, context):
         return
-    # forced_reply_to_message_id:
-    #   None -> normal behavior (may map replies)
-    #   0    -> explicitly disable replying in destination
-    reply_to_id = None if forced_reply_to_message_id == 0 else forced_reply_to_message_id
-    if reply_to_id is None and forced_reply_to_message_id != 0 and isinstance(dest_chat_id, int):
+
+    reply_to_id = None
+    if isinstance(dest_chat_id, int):
         reply_to_id = resolve_reply_to_id(src_msg, dest_chat_id)
 
     
+
+    # Para ciertas rutas de fanout (especialmente topics), no queremos “reply” automático.
+    # Esto evita el error visual de responder a una foto/mensaje ancla.
+    try:
+        src_thread = getattr(src_msg, "message_thread_id", None) or 1
+        if src_msg.chat.id == G1 and src_thread == 129 and isinstance(dest_chat_id, int) and dest_chat_id == G3 and dest_thread_id in (3, 4096):
+            reply_to_id = None
+        if src_msg.chat.id == G1 and src_thread == 129 and isinstance(dest_chat_id, int) and dest_chat_id == G4 and dest_thread_id == 8:
+            reply_to_id = None
+    except Exception:
+        pass
+
+
     # --- AUDIO: transcribir + traducir + reenviar como audio EN + texto EN ---
     if (getattr(src_msg, "voice", None) or getattr(src_msg, "audio", None)):
         try:
@@ -1105,7 +1136,7 @@ async def replicate_message(
         return
 
     await replicate_media_with_album_support(
-        context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate, forced_reply_to_message_id=reply_to_id
+        context, src_msg, dest_chat_id, dest_thread_id, do_translate=do_translate
     )
 
     mgid = getattr(src_msg, "media_group_id", None)
@@ -1297,8 +1328,6 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         thread_id = msg.message_thread_id
         sender_id = msg.from_user.id if msg.from_user else None
-        tid_norm = thread_id if thread_id is not None else 1
-
 
         route = map_topic(chat.id, thread_id, sender_id)
         if not route:
@@ -1318,11 +1347,12 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            await replicate_message(context, msg, dst_chat, dst_thread, do_translate=do_translate_main, forced_reply_to_message_id=None)
+            await replicate_message(context, msg, dst_chat, dst_thread, do_translate=do_translate_main)
         except Exception as e:
             log.warning("Fallo ruta principal %s#%s -> %s#%s: %s", chat.id, thread_id, dst_chat, dst_thread, e)
             await alert_error(context, f"Ruta principal fallo: {chat.id}#{thread_id} -> {dst_chat}#{dst_thread}\n{e}")
 
+        tid_norm = thread_id if thread_id is not None else 1
         extras = FANOUT_ROUTES.get((chat.id, tid_norm), [])
         for extra_chat, extra_thread in extras:
             do_translate_extra = not route_no_translate(chat.id, thread_id, extra_chat, extra_thread)
@@ -1336,18 +1366,7 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg.message_id,
             )
             try:
-                reply_fixed = None
-                if isinstance(extra_chat, int):
-                    reply_fixed = FIXED_REPLY_TO.get((chat.id, tid_norm, int(extra_chat), int(extra_thread)))
-                try:
-                    await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra, forced_reply_to_message_id=(None if (chat.id == G1 and tid_norm == 129) else reply_fixed))
-                except BadRequest as be:
-                    if reply_fixed is not None and 'Message to be replied not found' in str(be):
-                        # Fallback: enviar sin reply fijo
-                        await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra, forced_reply_to_message_id=(0 if (chat.id == G1 and tid_norm == 129) else None))
-                    else:
-                        raise
-
+                await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra)
             except Exception as e:
                 log.warning("Fallo fanout %s#%s -> %s#%s: %s", chat.id, tid_norm, extra_chat, extra_thread, e)
                 await alert_error(context, f"Fanout fallo: {chat.id}#{tid_norm} -> {extra_chat}#{extra_thread}\n{e}")

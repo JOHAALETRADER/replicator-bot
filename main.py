@@ -204,11 +204,13 @@ _TYPO_FIXES = [
 ]
 
 def _protect_urls(text: str) -> tuple[str, dict]:
+    """Replace URLs with placeholders (surrounded by spaces) so DeepL doesn't glue text around them."""
     urls = _URL_RE.findall(text or "")
-    placeholders = {}
+    placeholders: dict[str, str] = {}
     for i, url in enumerate(urls):
         ph = f"__URL{i}__"
-        text = text.replace(url, ph)
+        # Surround with spaces so it stays separated from adjacent words/punctuation.
+        text = text.replace(url, f" {ph} ")
         placeholders[ph] = url
     return text, placeholders
 
@@ -217,44 +219,100 @@ def _restore_urls(text: str, placeholders: dict) -> str:
         text = text.replace(ph, url)
     return text
 
-def preprocess_for_translation(text: str) -> tuple[str, dict]:
+def _protect_html_tags(text: str) -> tuple[str, dict]:
+    """Protect HTML tags (<b>, <i>, <u>, <a href=...>, etc.) so translators don't break them."""
     if not text:
         return text, {}
+    tags = re.findall(r"</?[^>]+?>", text)
+    placeholders: dict[str, str] = {}
+    for i, tag in enumerate(tags):
+        ph = f"__TAG{i}__"
+        text = text.replace(tag, ph)
+        placeholders[ph] = tag
+    return text, placeholders
+
+def _restore_html_tags(text: str, placeholders: dict) -> str:
+    for ph, tag in (placeholders or {}).items():
+        text = text.replace(ph, tag)
+    return text
+
+def preprocess_for_translation(text: str) -> tuple[str, dict]:
+    """
+    Preprocess to improve DeepL output while keeping:
+    - ✅ saltos de línea
+    - ✅ emojis
+    - ✅ tags HTML (b/i/u/a)
+    - ✅ URLs (sin pegarse a palabras)
+    """
+    if not text:
+        return text, {}
+
     t = text
+
     # Quitar invisibles típicos
     t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
-    # Separar emojis
+
+    # Proteger tags HTML (para no romper <b>...</b>, <a href=...>, etc.)
+    t, tag_ph = _protect_html_tags(t)
+
+    # Separar emojis pegados a palabras
     t = _EMOJI_JOIN_RE.sub(r"\1 \2", t)
     t = _EMOJI_JOIN_RE2.sub(r"\1 \2", t)
-    # Fix typos
+
+    # Fix typos conocidos que generan traducciones raras
     for rx, rep in _TYPO_FIXES:
         t = rx.sub(rep, t)
-    # Proteger URLs
-    t, placeholders = _protect_urls(t)
-    # Normalizar espacios
+
+    # Proteger URLs (con espacios alrededor)
+    t, url_ph = _protect_urls(t)
+
+    # Normalizar saltos de línea y "congelarlos" para que DeepL los respete
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = t.replace("\n", "__NL__")
+
+    # Normalizar espacios (sin tocar los __NL__)
     t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n\s*\n\s*\n+", "\n\n", t).strip()
+    t = re.sub(r"__NL__(?:\s*__NL__){2,}", "__NL____NL__", t).strip()
+
+    placeholders: dict[str, str] = {}
+    placeholders.update(tag_ph)
+    placeholders.update(url_ph)
     return t, placeholders
 
 def postprocess_translation(text: str, placeholders: dict) -> str:
     if not text:
         return text
     t = text
-    # Reponer URLs
+
+    # Restaurar saltos de línea
+    t = t.replace("__NL__", "\n")
+
+    # Restaurar HTML tags y URLs
+    t = _restore_html_tags(t, placeholders)
     t = _restore_urls(t, placeholders)
+
+    # Evitar que el URL se pegue con palabras (VIP:https://...Resultados)
+    t = re.sub(r"(https?://\S+)([A-Za-z0-9])", r"\1\n\2", t)
+    t = re.sub(r"([A-Za-z0-9])\s*(https?://)", r"\1\n\2", t)
+
     # Limpiar artefactos tipo \1 \2 si aparecieran por accidente
     t = t.replace("\\1", "").replace("\\2", "")
+
     # Ajustes mínimos para inglés más natural (trading/community)
     t = re.sub(r"\bconnect to live\b", "go live", t, flags=re.I)
     t = re.sub(r"\bcontinue growing together on this path\b", "keep growing together on this journey", t, flags=re.I)
+
     # Arreglos anti-mezcla ES->EN (conectores típicos que a veces quedan sin traducir)
     t = re.sub(r"\bMattersnte\s*:", "Important:", t, flags=re.I)
     t = re.sub(r"\bpara\s+that\b", "so that", t, flags=re.I)
     t = re.sub(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", r"for \1", t, flags=re.I)
     t = re.sub(r"\bpor\s+patience\b", "for your patience", t, flags=re.I)
-    # Normalizar espacios
-    t = re.sub(r"[ \t]+", " ", t).strip()
+
+    # Normalizar espacios (manteniendo saltos)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
+
 # ================== END TRANSLATION QUALITY PATCH ==================
 _ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
 
@@ -441,6 +499,7 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         "text": text2,
         "source_lang": SOURCE_LANG,
         "target_lang": TARGET_LANG,
+        "preserve_formatting": 1,
     }
     if TARGET_LANG in DEEPL_FORMALITY_LANGS:
         data["formality"] = FORMALITY

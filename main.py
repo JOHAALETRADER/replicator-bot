@@ -155,7 +155,6 @@ NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
 # Nota: si el mensaje no existe, hacemos fallback a enviar sin reply (no rompe el flujo).
 FIXED_REPLY_TO: Dict[Tuple[int, int, int, int], int] = {
     (G1, 129, G3, 3): 6033,       # ES → topic 3, reply al msg 6033
-    (G1, 129, G3, 4096): 6029,    # EN → topic 4096, reply al msg 6029
 }
 
 
@@ -460,7 +459,7 @@ async def openai_tts(text_en: str) -> bytes:
         "voice": OPENAI_TTS_VOICE,
         "input": text_en,
         "format": OPENAI_TTS_FORMAT,
-    }
+}
 
     timeout = aiohttp.ClientTimeout(total=OPENAI_TIMEOUT_SEC)
     async with aiohttp.ClientSession(timeout=timeout) as session:

@@ -217,67 +217,49 @@ def _restore_urls(text: str, placeholders: dict) -> str:
         text = text.replace(ph, url)
     return text
 
-def preprocess_for_translation(text: str) -> tuple[str, dict]:
-    """Prepara texto para DeepL SIN romper el formato de Telegram.
-    - Conserva saltos de línea
-    - Protege URLs con placeholders
-    - Limpia invisibles típicos
-    - Separa emojis pegados a letras/números para evitar traducciones raras
+def preprocess_for_translation(text: str) -> tuple[str, list[str]]:
+    """Prepare text for translation without destroying Telegram formatting.
+    We only protect URLs so DeepL won't alter them.
+    We *do not* replace spaces/newlines (those tricks were causing words to merge
+    when DeepL removed or changed placeholder characters).
     """
     if not text:
-        return text, {}
-    t = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Quitar invisibles típicos
-    t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
-    # Separar emojis (cuando están pegados a texto)
-    t = _EMOJI_JOIN_RE.sub(r"\1 \2", t)
-    t = _EMOJI_JOIN_RE2.sub(r"\1 \2", t)
-    # Fix typos
-    for rx, rep in _TYPO_FIXES:
-        t = rx.sub(rep, t)
-    # Proteger URLs
-    t, placeholders = _protect_urls(t)
+        return "", []
 
-    # Normalizar espacios SOLO dentro de cada línea (no colapsar líneas)
-    lines = t.split("\n")
-    norm_lines = []
-    for line in lines:
-        if line == "":
-            norm_lines.append("")
-            continue
-        line = re.sub(r"[ \t]+", " ", line).strip()
-        norm_lines.append(line)
-    t = "\n".join(norm_lines)
+    # Normalize line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Reducir exceso de saltos (máx 2 en fila)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t, placeholders
+    urls: list[str] = []
+
+    def _repl(m: re.Match) -> str:
+        urls.append(m.group(0))
+        return f"__URL{len(urls)-1}__"
+
+    safe_text = URL_RE.sub(_repl, text)
+    return safe_text, urls
 
 
-def postprocess_translation(translated: str, placeholders: dict) -> str:
-    """Limpia salida de DeepL SIN romper formato.
-    - Restaura URLs
-    - Conserva saltos de línea
-    - Normaliza espacios por línea
-    """
+def postprocess_translation(translated: str, urls: list[str]) -> str:
+    """Restore URLs and do minimal cleanup, keeping Telegram-ready text."""
     if not translated:
-        return translated
-    t = translated.replace("\r\n", "\n").replace("\r", "\n")
-    # Restaurar URLs primero (para no pegar texto luego)
-    t = _restore_urls(t, placeholders)
+        return ""
 
-    lines = t.split("\n")
-    out_lines = []
-    for line in lines:
-        if line == "":
-            out_lines.append("")
-            continue
-        line = re.sub(r"[ \t]+", " ", line).strip()
-        out_lines.append(line)
-    t = "\n".join(out_lines)
+    text = translated
 
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t
+    # Restore URL placeholders
+    for i, url in enumerate(urls or []):
+        text = text.replace(f"__URL{i}__", url)
+
+    # Fix cases where a URL got glued to letters/numbers
+    text = re.sub(r"(?<=\w)(https?://)", r" \1", text)
+    text = re.sub(r"(https?://\S+)(?=\w)", r"\1 ", text)
+
+    # Normalize weird non-breaking spaces DeepL sometimes returns
+    text = text.replace("\u00a0", " ")
+
+    # Do NOT collapse newlines; just trim trailing spaces per line
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return text.strip()
 
 
 def probably_english(text: str) -> bool:
@@ -458,13 +440,19 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
 
     url = f"https://{DEEPL_API_HOST}/v2/translate"
     data = {
-        "auth_key": DEEPL_API_KEY,
-        "text": text2,
-        "source_lang": SOURCE_LANG,
-        "preserve_formatting": True,
+        "text": text_pre,
+        "target_lang": target_lang,
+        # If you KNOW your source is always Spanish, set SOURCE_LANG=ES in Railway.
+        "source_lang": os.getenv("SOURCE_LANG", "").strip() or None,
+        # Keep formatting and avoid joining lines
+        "preserve_formatting": "1",
         "split_sentences": "nonewlines",
-        "target_lang": TARGET_LANG,
+        # Keep Telegram HTML tags intact if present (e.g., <b>...</b>)
+        "tag_handling": "html",
     }
+    if not data["source_lang"]:
+        data.pop("source_lang", None)
+
     if TARGET_LANG in DEEPL_FORMALITY_LANGS:
         data["formality"] = FORMALITY
     if gid:

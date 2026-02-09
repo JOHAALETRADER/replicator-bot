@@ -236,213 +236,54 @@ def _restore_html_tags(text: str, placeholders: dict) -> str:
         text = text.replace(ph, tag)
     return text
 
-def preprocess_for_translation(text: str) -> tuple[str, dict[str, str]]:
+def preprocess_for_translation(text: str):
+    """Preprocesado mínimo:
+    - Mantener saltos de línea
+    - Proteger URLs para que DeepL no las modifique ni las pegue con palabras
     """
-    Preprocesado *mínimo y seguro*:
-    - Mantiene saltos de línea reales (NO usamos tokens tipo NL__).
-    - Protege URLs para que DeepL no las “pegue” ni las altere.
-    Retorna: (texto_preparado, mapa_placeholders_url)
+    if text is None:
+        return "", {}
+
+    # Normaliza saltos
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Extrae URLs y las reemplaza por tokens NO traducibles
+    url_map = {}
+    def _repl(m):
+        token = f"⟦URL{len(url_map)}⟧"
+        url_map[token] = m.group(0)
+        return token
+
+    # URL pattern simple y estable (http/https)
+    t = re.sub(r"https?://[^\s)\]}>\"']+", _repl, t)
+
+    # Asegura separación mínima alrededor de tokens (evita 'palabra⟦URL0⟧')
+    t = re.sub(r"([\wÁÉÍÓÚÜÑáéíóúüñ])(?=⟦URL\d+⟧)", r"\1 ", t)
+    t = re.sub(r"(⟦URL\d+⟧)(?=[\wÁÉÍÓÚÜÑáéíóúüñ])", r"\1 ", t)
+
+    return t, url_map
+
+def postprocess_translation(text: str, url_map: dict):
+    """Postprocesado mínimo:
+    - Restaurar URLs tal cual
+    - Limpieza ligera de espacios sin romper estructura
     """
-    # Normaliza saltos de línea
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if text is None:
+        return ""
+    t = text
 
-    # Protege URLs (DeepL a veces cambia espacios/partes del link)
-    url_map: dict[str, str] = {}
-    def _url_repl(m: re.Match) -> str:
-        key = f"__URL{len(url_map)}__"
-        url_map[key] = m.group(0)
-        return key
+    # Restaura URLs
+    if url_map:
+        for token, url in url_map.items():
+            t = t.replace(token, url)
 
-    # Nota: detecta URLs comunes (http/https)
-    safe = re.sub(r"https?://\S+", _url_repl, text)
+    # Mantén saltos, pero limpia espacios finales por línea
+    t = "\n".join([ln.rstrip() for ln in t.replace("\r\n", "\n").replace("\r", "\n").split("\n")])
 
-    return safe, url_map
-def postprocess_translation(text: str, url_map: dict[str, str]) -> str:
-    """
-    Postproceso para dejar salida *limpia*:
-    - Restaura URLs protegidas
-    - Arregla casos típicos donde el link queda pegado a una palabra (VIPhttps://...)
-    - Elimina artefactos tipo NL__/__NL__ si aparecieran por mensajes antiguos
-    - Mantiene saltos de línea
-    """
-    out = text or ""
+    # Evita que Telegram pegue el link al texto anterior (por si DeepL quitó un salto)
+    t = re.sub(r"(?<!\n)(https?://)", r"\n\1", t)
 
-    # 1) Quita artefactos de builds anteriores (por si llegan a colarse)
-    out = out.replace("__NL__", "\n")
-    # Remueve NL__ aunque esté pegado a letras (no usamos \b)
-    out = re.sub(r"NL\s*L?__", "", out, flags=re.I)
-
-    # 2) Restaura URLs
-    for k, v in (url_map or {}).items():
-        out = out.replace(k, v)
-
-    # 3) Evita URL pegada (por ejemplo "VIP:https://..." o "VIPhttps://...")
-    out = re.sub(r"(?i)(\bVIP\b)\s*:\s*(https?://)", r"\1:\n\2", out)
-    out = re.sub(r"(?i)(\bVIP\b)\s+(https?://)", r"\1\n\2", out)
-    out = re.sub(r"(?i)(\bVIP\b)(https?://)", r"\1\n\2", out)
-
-    # Si cualquier palabra queda pegada justo antes de un http, mete un espacio (último recurso)
-    out = re.sub(r"([A-Za-z0-9])(?=https?://)", r"\1\n", out)
-
-    # 4) Limpieza de espacios raros
-    out = re.sub(r"[ \t]+\n", "\n", out)
-    out = re.sub(r"\n{4,}", "\n\n\n", out)  # no más de 3 saltos seguidos
-
-    return out
-def probably_english(text: str) -> bool:
-    if _ES_MARKERS.search(text):
-        return False
-    if _EN_COMMON.search(text):
-        return True
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
-        return False
-    ascii_letters = [c for c in letters if ord(c) < 128]
-    return (len(ascii_letters) / max(1, len(letters))) > 0.85
-
-
-# ================== ENTIDADES HTML ==================
-SAFE_TAGS = {"b", "strong", "i", "em", "u", "s", "del", "code", "pre", "a"}
-
-
-def escape(t: str) -> str:
-    return html.escape(t, quote=False)
-
-
-def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str, Dict[str, Any]]]:
-    if not entities:
-        return [(text, {})]
-    entities = sorted(entities, key=lambda e: e.offset)
-    res: List[Tuple[str, Dict[str, Any]]] = []
-    idx = 0
-    for e in entities:
-        if e.offset > idx:
-            res.append((text[idx:e.offset], {}))
-        frag = text[e.offset:e.offset + e.length]
-        meta: Dict[str, Any] = {}
-        if e.type in ("bold",):
-            meta["tag"] = "b"
-        elif e.type in ("italic",):
-            meta["tag"] = "i"
-        elif e.type in ("underline",):
-            meta["tag"] = "u"
-        elif e.type in ("strikethrough",):
-            meta["tag"] = "s"
-        elif e.type in ("code",):
-            meta["tag"] = "code"
-        elif e.type == "text_link" and e.url:
-            meta["tag"] = "a"
-            meta["href"] = e.url
-        else:
-            meta = {}
-        res.append((frag, meta))
-        idx = e.offset + e.length
-    if idx < len(text):
-        res.append((text[idx:], {}))
-    return res
-
-
-def build_html(fragments: List[Tuple[str, Dict[str, Any]]]) -> str:
-    out: List[str] = []
-    for frag, meta in fragments:
-        safe = escape(frag)
-        tag = meta.get("tag")
-        if not tag:
-            out.append(safe)
-            continue
-        if tag == "a":
-            href = html.escape(meta.get("href", ""), quote=True)
-            out.append(f'<a href="{href}">{safe}</a>')
-        elif tag in SAFE_TAGS:
-            out.append(f"<{tag}>{safe}</{tag}>")
-        else:
-            out.append(safe)
-    return "".join(out)
-
-
-# ================== GLOSARIO (DEFAULT) ==================
-DEFAULT_GLOSSARY_TSV = """\
-JOHAALETRADER\tJOHAALETRADER
-JT TRADERS\tJT TRADERS
-JT TRADERS TEAMS\tJT TRADERS TEAMS
-JT TRADERS MASTERMIND\tJT TRADERS MASTERMIND
-Binomo\tBinomo
-binary options\tbinary options
-setup\tsetup
-signal\tsignal
-signals\tsignals
-entry\tentry
-stop loss\tstop loss
-take profit\ttake profit
-TP\tTP
-SL\tSL
-risk management\trisk management
-trailing stop\ttrailing stop
-win rate\twin rate
-candlestick\tcandlestick
-EMA\tEMA
-SMA\tSMA
-RSI\tRSI
-MACD\tMACD
-breakout\tbreakout
-pullback\tpullback
-order block\torder block
-liquidity\tliquidity
-spread\tspread
-hedging\thedging
-derivatives\tderivatives
-leverage\tleverage
-support\tsupport
-resistance\tresistance
-market structure\tmarket structure
-bullish\tbullish
-bearish\tbearish
-"""
-
-# ================== TRADUCCIÓN (DEEPL + GLOSARIO) ==================
-DEEPL_FORMALITY_LANGS = {"DE", "FR", "IT", "ES", "NL", "PL", "PT-PT", "PT-BR", "RU", "JA"}
-_glossary_id_mem: Optional[str] = None  # cache en memoria para esta ejecución
-
-
-async def deepl_create_glossary_if_needed() -> Optional[str]:
-    global _glossary_id_mem, GLOSSARY_ID
-    if not TRANSLATE or not DEEPL_API_KEY:
-        return None
-    if GLOSSARY_ID:
-        _glossary_id_mem = GLOSSARY_ID
-        return GLOSSARY_ID
-
-    entries = (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV).strip()
-    if not entries:
-        return None
-
-    url = f"https://{DEEPL_API_HOST}/v2/glossaries"
-    form = aiohttp.FormData()
-    form.add_field("name", "Trading ES-EN (Auto)")
-    form.add_field("source_lang", SOURCE_LANG or "ES")
-    form.add_field("target_lang", TARGET_LANG or "EN")
-    form.add_field("entries", entries, filename="glossary.tsv", content_type="text/tab-separated-values")
-
-    headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
-    timeout = aiohttp.ClientTimeout(total=30)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, data=form) as resp:
-                body = await resp.text()
-                if resp.status != 200:
-                    log.warning("DeepL glossary create HTTP %s: %s", resp.status, body)
-                    return None
-                js = await resp.json()
-                gid = js.get("glossary_id", "")
-                if gid:
-                    _glossary_id_mem = gid
-                    GLOSSARY_ID = gid
-                    log.info("DeepL glossary created: %s", gid)
-                    return gid
-    except Exception as e:
-        log.warning("DeepL glossary create failed: %s", e)
-    return None
-
+    return t
 
 async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
     if not text.strip():
@@ -630,20 +471,20 @@ async def replicate_audio_with_translation(
         await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=False)
     return
 # ================== TRADUCCIÓN VISIBLE ==================
-async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
-    frags = entities_to_html(text, entities or [])
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        new_frags: List[Tuple[str, Dict[str, Any]]] = []
-        for frag, meta in frags:
-            if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
-                new_text = await deepl_translate(frag, session=session)
-                new_frags.append((new_text, meta))
-            else:
-                new_frags.append((frag, meta))
-    html_text = build_html(new_frags)
-    return html_text, []
-
+async def translate_visible_html(text: str, entities, *, session: aiohttp.ClientSession):
+    """Traducción *literal y limpia*.
+    Para evitar artefactos (NL_, palabras pegadas, emojis raros, etc.), traducimos el TEXTO PLANO completo.
+    - No tocamos rutas ni lógica
+    - No reconstruimos HTML/entidades (Telegram auto-linkea URLs)
+    """
+    if text is None:
+        return "", []
+    try:
+        out = await deepl_translate(text, session=session)
+        return out, []
+    except Exception as e:
+        log.warning("translate_visible_html fallo: %s", e)
+        return text, []
 
 def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
     return build_html(entities_to_html(text, entities or []))

@@ -299,8 +299,16 @@ def postprocess_translation(text: str, placeholders: dict) -> str:
     t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*L\s*(?:__|_)+", "__NL__", t)
     t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*(?:__|_)+", "__NL__", t)
 
+    # Variantes sin guiones bajos al inicio (ej: NL__I have..., NL__ Includes:)
+    t = re.sub(r"(?i)\bNL\s*L?\s*__\b", "__NL__", t)
+    t = re.sub(r"(?i)\bNL\s*L?\s*_\b", "__NL__", t)
+
     # 2) Restaurar saltos (antes de restaurar placeholders, para conservar formato)
     t = t.replace("__NL__", "\n")
+    # Si quedó algún token suelto tipo NL__ o NLL__ (sin __ al inicio), elimínalo
+    t = re.sub(r"(?i)\bNLL?__\b", "", t)
+    t = re.sub(r"(?i)\bNLL?\b", "", t)
+
 
     # 3) Restaurar tags HTML y URLs
     t = _restore_html_tags(t, placeholders)

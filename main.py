@@ -1,15 +1,3 @@
-
-# === TRANSLATION CLEAN PATCH ===
-def clean_translation_text(t):
-    import re
-    if not isinstance(t, str):
-        return t
-    t = re.sub(r'\s+\n', '\n', t)
-    t = re.sub(r'\n{3,}', '\n\n', t)
-    t = re.sub(r'([^\n])https://', r'\1\nhttps://', t)
-    return t.strip()
-
-
 import os
 import html
 import logging
@@ -280,11 +268,11 @@ def preprocess_for_translation(text: str) -> tuple[str, dict]:
 
     # Normalizar saltos de línea y "congelarlos" para que DeepL los respete
     t = t.replace("\r\n", "\n").replace("\r", "\n")
-    t = t
+    t = t.replace("\n", "__NL__")
 
-    # Normalizar espacios (sin tocar los )
+    # Normalizar espacios (sin tocar los __NL__)
     t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"(?:\s*){2,}", "", t).strip()
+    t = re.sub(r"__NL__(?:\s*__NL__){2,}", "__NL____NL__", t).strip()
 
     placeholders: dict[str, str] = {}
     placeholders.update(tag_ph)
@@ -308,11 +296,11 @@ def postprocess_translation(text: str, placeholders: dict) -> str:
 
     # 1) Normalizar tokens de salto de línea que a veces DeepL altera
     #    Ej: _NLL__, __NLL__, __ NL __, _ nl _, etc.
-    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*L\s*(?:__|_)+", "", t)
-    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*(?:__|_)+", "", t)
+    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*L\s*(?:__|_)+", "__NL__", t)
+    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*(?:__|_)+", "__NL__", t)
 
     # 2) Restaurar saltos (antes de restaurar placeholders, para conservar formato)
-    t = t
+    t = t.replace("__NL__", "\n")
 
     # 3) Restaurar tags HTML y URLs
     t = _restore_html_tags(t, placeholders)
@@ -320,11 +308,11 @@ def postprocess_translation(text: str, placeholders: dict) -> str:
 
     # 4) Evitar que URLs se peguen (casos VIP:https://...Resultados / ...JTTRADERSReal)
     #    - si un URL viene pegado a letra/número -> separa por salto de línea
-    t = t
-    t = t
+    t = re.sub(r"(https?://\S+?)(?=[A-Za-z0-9])", r"\1\n", t)
+    t = re.sub(r"(?<=[A-Za-z0-9])\s*(https?://)", r"\n\1", t)
 
     # 5) Si el URL está en una línea con texto justo antes del : sin espacio, lo acomoda
-    t = t
+    t = re.sub(r":\s*(https?://)", r":\n\1", t)
 
     # 6) Limpiar artefactos tipo \1 \2 si por algún motivo se filtraron
     t = t.replace("\\1", "").replace("\\2", "")
@@ -514,7 +502,7 @@ async def deepl_create_glossary_if_needed() -> Optional[str]:
     return None
 
 
-async def clean_translation_text(deepl_translate(text: str, *, session: aiohttp.ClientSession)) -> str:
+async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
     if not text.strip():
         return text
     if not TRANSLATE or not DEEPL_API_KEY:
@@ -672,7 +660,7 @@ async def replicate_audio_with_translation(
         try:
             timeout = aiohttp.ClientTimeout(total=45)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                caption_text = await clean_translation_text(deepl_translate(transcript.strip()), session=session)
+                caption_text = await deepl_translate(transcript.strip(), session=session)
         except Exception as e:
             log.warning("Audio translate text failed (msg %s): %s", src_msg.message_id, e)
             caption_text = ""
@@ -707,7 +695,7 @@ async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tu
         new_frags: List[Tuple[str, Dict[str, Any]]] = []
         for frag, meta in frags:
             if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
-                new_text = await clean_translation_text(deepl_translate(frag, session=session))
+                new_text = await deepl_translate(frag, session=session)
                 new_frags.append((new_text, meta))
             else:
                 new_frags.append((frag, meta))
@@ -730,7 +718,7 @@ async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_transl
         for row in markup.inline_keyboard:
             new_row: List[InlineKeyboardButton] = []
             for b in row:
-                label = await clean_translation_text(deepl_translate(b.text or "", session=session))
+                label = await deepl_translate(b.text or "", session=session)
                 new_row.append(
                     InlineKeyboardButton(
                         text=(label or "")[:64],

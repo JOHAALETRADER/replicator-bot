@@ -471,21 +471,29 @@ async def replicate_audio_with_translation(
         await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=False)
     return
 # ================== TRADUCCIÓN VISIBLE ==================
-async def translate_visible_html(text: str, entities, *, session: aiohttp.ClientSession):
-    """Traducción *literal y limpia*.
-    Para evitar artefactos (NL_, palabras pegadas, emojis raros, etc.), traducimos el TEXTO PLANO completo.
-    - No tocamos rutas ni lógica
-    - No reconstruimos HTML/entidades (Telegram auto-linkea URLs)
-    """
-    if text is None:
-        return "", []
+async def translate_visible_html(text: str, entities, *, session: aiohttp.ClientSession | None = None):
+    _own_session = False
+    if session is None:
+        _own_session = True
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25))
     try:
-        out = await deepl_translate(text, session=session)
-        return out, []
-    except Exception as e:
-        log.warning("translate_visible_html fallo: %s", e)
-        return text, []
+        """Traducción *literal y limpia*.
+        Para evitar artefactos (NL_, palabras pegadas, emojis raros, etc.), traducimos el TEXTO PLANO completo.
+        - No tocamos rutas ni lógica
+        - No reconstruimos HTML/entidades (Telegram auto-linkea URLs)
+        """
+        if text is None:
+            return "", []
+        try:
+            out = await deepl_translate(text, session=session)
+            return out, []
+        except Exception as e:
+            log.warning("translate_visible_html fallo: %s", e)
+            return text, []
 
+    finally:
+        if _own_session:
+            await session.close()
 def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
     return build_html(entities_to_html(text, entities or []))
 

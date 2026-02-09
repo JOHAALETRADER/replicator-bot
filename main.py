@@ -217,47 +217,53 @@ def _restore_urls(text: str, placeholders: dict) -> str:
         text = text.replace(ph, url)
     return text
 
-def preprocess_for_translation(text: str) -> tuple[str, dict]:
+def preprocess_for_translation(text: str) -> tuple[str, dict[str, str]]:
+    """Preprocesado **mínimo y seguro**:
+    - Protege URLs para que DeepL no las rompa ni las pegue al texto.
+    - No toca emojis ni cambia palabras (evita artefactos tipo '¿Quieresreceive').
+    - Conserva saltos de línea tal cual.
+    """
     if not text:
         return text, {}
-    t = text
-    # Quitar invisibles típicos
-    t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
-    # Separar emojis
-    t = _EMOJI_JOIN_RE.sub(r"\1 \2", t)
-    t = _EMOJI_JOIN_RE2.sub(r"\1 \2", t)
-    # Fix typos
-    for rx, rep in _TYPO_FIXES:
-        t = rx.sub(rep, t)
-    # Proteger URLs
-    t, placeholders = _protect_urls(t)
-    # Normalizar espacios
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n\s*\n\s*\n+", "\n\n", t).strip()
-    return t, placeholders
 
-def postprocess_translation(text: str, placeholders: dict) -> str:
+    # Quitar caracteres invisibles problemáticos
+    text = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", text)
+
+    urls: dict[str, str] = {}
+
+    def _repl(m: re.Match) -> str:
+        ph = f"__URL_{len(urls)}__"
+        urls[ph] = m.group(0)
+        # asegurar separación para que no se pegue con palabras
+        return f"\n{ph}\n"
+
+    protected = _URL_RE.sub(_repl, text)
+    # Evitar líneas demasiado vacías por la protección
+    protected = re.sub(r"\n{3,}", "\n\n", protected)
+    return protected, urls
+
+def postprocess_translation(text: str, urls: dict[str, str]) -> str:
+    """Postprocesado mínimo:
+    - Restaura URLs exactamente.
+    - Mantiene saltos de línea.
+    - Arregla espacios raros sin 'inventar' palabras.
+    """
     if not text:
         return text
-    t = text
-    # Reponer URLs
-    t = _restore_urls(t, placeholders)
-    # Limpiar artefactos tipo \1 \2 si aparecieran por accidente
-    t = t.replace("\\1", "").replace("\\2", "")
-    # Ajustes mínimos para inglés más natural (trading/community)
-    t = re.sub(r"\bconnect to live\b", "go live", t, flags=re.I)
-    t = re.sub(r"\bcontinue growing together on this path\b", "keep growing together on this journey", t, flags=re.I)
-    # Arreglos anti-mezcla ES->EN (conectores típicos que a veces quedan sin traducir)
-    t = re.sub(r"\bMattersnte\s*:", "Important:", t, flags=re.I)
-    t = re.sub(r"\bpara\s+that\b", "so that", t, flags=re.I)
-    t = re.sub(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", r"for \1", t, flags=re.I)
-    t = re.sub(r"\bpor\s+patience\b", "for your patience", t, flags=re.I)
-    # Normalizar espacios
-    t = re.sub(r"[ \t]+", " ", t).strip()
-    return t
-# ================== END TRANSLATION QUALITY PATCH ==================
-_ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
 
+    # Restaurar placeholders de URL
+    for ph, url in urls.items():
+        text = text.replace(ph, url)
+
+    # Si DeepL pegó una URL a texto, forzamos salto de línea antes
+    text = re.sub(r"(?<!\n)(https?://)", r"\n\1", text)
+
+    # Limpieza suave de espacios (sin tocar \n)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
 
 def probably_english(text: str) -> bool:
     if _ES_MARKERS.search(text):

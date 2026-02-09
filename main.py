@@ -204,13 +204,11 @@ _TYPO_FIXES = [
 ]
 
 def _protect_urls(text: str) -> tuple[str, dict]:
-    """Replace URLs with placeholders (surrounded by spaces) so DeepL doesn't glue text around them."""
     urls = _URL_RE.findall(text or "")
-    placeholders: dict[str, str] = {}
+    placeholders = {}
     for i, url in enumerate(urls):
         ph = f"__URL{i}__"
-        # Surround with spaces so it stays separated from adjacent words/punctuation.
-        text = text.replace(url, f" {ph} ")
+        text = text.replace(url, ph)
         placeholders[ph] = url
     return text, placeholders
 
@@ -219,118 +217,246 @@ def _restore_urls(text: str, placeholders: dict) -> str:
         text = text.replace(ph, url)
     return text
 
-def _protect_html_tags(text: str) -> tuple[str, dict]:
-    """Protect HTML tags (<b>, <i>, <u>, <a href=...>, etc.) so translators don't break them."""
+def preprocess_for_translation(text: str) -> tuple[str, dict]:
     if not text:
         return text, {}
-    tags = re.findall(r"</?[^>]+?>", text)
-    placeholders: dict[str, str] = {}
-    for i, tag in enumerate(tags):
-        ph = f"__TAG{i}__"
-        text = text.replace(tag, ph)
-        placeholders[ph] = tag
-    return text, placeholders
-
-def _restore_html_tags(text: str, placeholders: dict) -> str:
-    for ph, tag in (placeholders or {}).items():
-        text = text.replace(ph, tag)
-    return text
-
-def preprocess_for_translation(text: str):
-    """Preprocesado mínimo:
-    - Mantener saltos de línea
-    - Proteger URLs para que DeepL no las modifique ni las pegue con palabras
-    """
-    if text is None:
-        return "", {}
-
-    # Normaliza saltos
-    t = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Extrae URLs y las reemplaza por tokens NO traducibles
-    url_map = {}
-    def _repl(m):
-        token = f"⟦URL{len(url_map)}⟧"
-        url_map[token] = m.group(0)
-        return token
-
-    # URL pattern simple y estable (http/https)
-    t = re.sub(r"https?://[^\s)\]}>\"']+", _repl, t)
-
-    # Asegura separación mínima alrededor de tokens (evita 'palabra⟦URL0⟧')
-    t = re.sub(r"([\wÁÉÍÓÚÜÑáéíóúüñ])(?=⟦URL\d+⟧)", r"\1 ", t)
-    t = re.sub(r"(⟦URL\d+⟧)(?=[\wÁÉÍÓÚÜÑáéíóúüñ])", r"\1 ", t)
-
-    return t, url_map
-
-def postprocess_translation(text: str, url_map: dict):
-    """Postprocesado mínimo:
-    - Restaurar URLs tal cual
-    - Limpieza ligera de espacios sin romper estructura
-    """
-    if text is None:
-        return ""
     t = text
+    # Quitar invisibles típicos
+    t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
+    # Separar emojis
+    t = _EMOJI_JOIN_RE.sub(r"\1 \2", t)
+    t = _EMOJI_JOIN_RE2.sub(r"\1 \2", t)
+    # Fix typos
+    for rx, rep in _TYPO_FIXES:
+        t = rx.sub(rep, t)
+    # Proteger URLs
+    t, placeholders = _protect_urls(t)
+    # Normalizar espacios
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n\s*\n\s*\n+", "\n\n", t).strip()
+    return t, placeholders
 
-    # Restaura URLs
-    if url_map:
-        for token, url in url_map.items():
-            t = t.replace(token, url)
-
-    # Mantén saltos, pero limpia espacios finales por línea
-    t = "\n".join([ln.rstrip() for ln in t.replace("\r\n", "\n").replace("\r", "\n").split("\n")])
-
-    # Evita que Telegram pegue el link al texto anterior (por si DeepL quitó un salto)
-    t = re.sub(r"(?<!\n)(https?://)", r"\n\1", t)
-
+def postprocess_translation(text: str, placeholders: dict) -> str:
+    if not text:
+        return text
+    t = text
+    # Reponer URLs
+    t = _restore_urls(t, placeholders)
+    # Limpiar artefactos tipo \1 \2 si aparecieran por accidente
+    t = t.replace("\\1", "").replace("\\2", "")
+    # Ajustes mínimos para inglés más natural (trading/community)
+    t = re.sub(r"\bconnect to live\b", "go live", t, flags=re.I)
+    t = re.sub(r"\bcontinue growing together on this path\b", "keep growing together on this journey", t, flags=re.I)
+    # Arreglos anti-mezcla ES->EN (conectores típicos que a veces quedan sin traducir)
+    t = re.sub(r"\bMattersnte\s*:", "Important:", t, flags=re.I)
+    t = re.sub(r"\bpara\s+that\b", "so that", t, flags=re.I)
+    t = re.sub(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", r"for \1", t, flags=re.I)
+    t = re.sub(r"\bpor\s+patience\b", "for your patience", t, flags=re.I)
+    # Normalizar espacios
+    t = re.sub(r"[ \t]+", " ", t).strip()
     return t
+# ================== END TRANSLATION QUALITY PATCH ==================
+_ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
 
-async def deepl_translate(text: str, *, session: aiohttp.ClientSession, source_lang: str = "ES", target_lang: str = "EN") -> str:
-    """DeepL translation with minimal safe preprocessing: preserve URLs, emojis, and line breaks."""
-    global _glossary_id_mem
 
-    auth = (os.getenv("DEEPL_API_KEY") or os.getenv("DEEPL_AUTH_KEY") or "").strip()
-    if not auth:
-        # If no API key, return original text (fail-open)
-        return text
+def probably_english(text: str) -> bool:
+    if _ES_MARKERS.search(text):
+        return False
+    if _EN_COMMON.search(text):
+        return True
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
+    ascii_letters = [c for c in letters if ord(c) < 128]
+    return (len(ascii_letters) / max(1, len(letters))) > 0.85
 
-    # DeepL endpoint (free/pro)
-    base = os.getenv("DEEPL_API_URL", "").strip() or ("https://api-free.deepl.com" if auth.endswith(":fx") or auth.endswith(":FX") else "https://api.deepl.com")
-    url = base.rstrip("/") + "/v2/translate"
 
-    protected, url_map = preprocess_for_translation(text)
+# ================== ENTIDADES HTML ==================
+SAFE_TAGS = {"b", "strong", "i", "em", "u", "s", "del", "code", "pre", "a"}
 
-    # Cache (or create) glossary if possible
-    if _glossary_id_mem is None:
-        _glossary_id_mem = await deepl_create_glossary_if_needed(session)
 
-    data = {
-        "text": protected,
-        "source_lang": source_lang,
-        "target_lang": target_lang,
-        "tag_handling": "xml",  # helps keep placeholders/tags stable
-        "preserve_formatting": "1",
-    }
-    if _glossary_id_mem:
-        data["glossary_id"] = _glossary_id_mem
+def escape(t: str) -> str:
+    return html.escape(t, quote=False)
 
+
+def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str, Dict[str, Any]]]:
+    if not entities:
+        return [(text, {})]
+    entities = sorted(entities, key=lambda e: e.offset)
+    res: List[Tuple[str, Dict[str, Any]]] = []
+    idx = 0
+    for e in entities:
+        if e.offset > idx:
+            res.append((text[idx:e.offset], {}))
+        frag = text[e.offset:e.offset + e.length]
+        meta: Dict[str, Any] = {}
+        if e.type in ("bold",):
+            meta["tag"] = "b"
+        elif e.type in ("italic",):
+            meta["tag"] = "i"
+        elif e.type in ("underline",):
+            meta["tag"] = "u"
+        elif e.type in ("strikethrough",):
+            meta["tag"] = "s"
+        elif e.type in ("code",):
+            meta["tag"] = "code"
+        elif e.type == "text_link" and e.url:
+            meta["tag"] = "a"
+            meta["href"] = e.url
+        else:
+            meta = {}
+        res.append((frag, meta))
+        idx = e.offset + e.length
+    if idx < len(text):
+        res.append((text[idx:], {}))
+    return res
+
+
+def build_html(fragments: List[Tuple[str, Dict[str, Any]]]) -> str:
+    out: List[str] = []
+    for frag, meta in fragments:
+        safe = escape(frag)
+        tag = meta.get("tag")
+        if not tag:
+            out.append(safe)
+            continue
+        if tag == "a":
+            href = html.escape(meta.get("href", ""), quote=True)
+            out.append(f'<a href="{href}">{safe}</a>')
+        elif tag in SAFE_TAGS:
+            out.append(f"<{tag}>{safe}</{tag}>")
+        else:
+            out.append(safe)
+    return "".join(out)
+
+
+# ================== GLOSARIO (DEFAULT) ==================
+DEFAULT_GLOSSARY_TSV = """\
+JOHAALETRADER\tJOHAALETRADER
+JT TRADERS\tJT TRADERS
+JT TRADERS TEAMS\tJT TRADERS TEAMS
+JT TRADERS MASTERMIND\tJT TRADERS MASTERMIND
+Binomo\tBinomo
+binary options\tbinary options
+setup\tsetup
+signal\tsignal
+signals\tsignals
+entry\tentry
+stop loss\tstop loss
+take profit\ttake profit
+TP\tTP
+SL\tSL
+risk management\trisk management
+trailing stop\ttrailing stop
+win rate\twin rate
+candlestick\tcandlestick
+EMA\tEMA
+SMA\tSMA
+RSI\tRSI
+MACD\tMACD
+breakout\tbreakout
+pullback\tpullback
+order block\torder block
+liquidity\tliquidity
+spread\tspread
+hedging\thedging
+derivatives\tderivatives
+leverage\tleverage
+support\tsupport
+resistance\tresistance
+market structure\tmarket structure
+bullish\tbullish
+bearish\tbearish
+"""
+
+# ================== TRADUCCIÓN (DEEPL + GLOSARIO) ==================
+DEEPL_FORMALITY_LANGS = {"DE", "FR", "IT", "ES", "NL", "PL", "PT-PT", "PT-BR", "RU", "JA"}
+_glossary_id_mem: Optional[str] = None  # cache en memoria para esta ejecución
+
+
+async def deepl_create_glossary_if_needed() -> Optional[str]:
+    global _glossary_id_mem, GLOSSARY_ID
+    if not TRANSLATE or not DEEPL_API_KEY:
+        return None
+    if GLOSSARY_ID:
+        _glossary_id_mem = GLOSSARY_ID
+        return GLOSSARY_ID
+
+    entries = (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV).strip()
+    if not entries:
+        return None
+
+    url = f"https://{DEEPL_API_HOST}/v2/glossaries"
+    form = aiohttp.FormData()
+    form.add_field("name", "Trading ES-EN (Auto)")
+    form.add_field("source_lang", SOURCE_LANG or "ES")
+    form.add_field("target_lang", TARGET_LANG or "EN")
+    form.add_field("entries", entries, filename="glossary.tsv", content_type="text/tab-separated-values")
+
+    headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
+    timeout = aiohttp.ClientTimeout(total=30)
     try:
-        async with session.post(url, data=data, headers={"Authorization": f"DeepL-Auth-Key {auth}"}, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-            if resp.status >= 400:
-                return text
-            j = await resp.json()
-            out = (j.get("translations") or [{}])[0].get("text") or ""
-    except Exception:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, data=form) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    log.warning("DeepL glossary create HTTP %s: %s", resp.status, body)
+                    return None
+                js = await resp.json()
+                gid = js.get("glossary_id", "")
+                if gid:
+                    _glossary_id_mem = gid
+                    GLOSSARY_ID = gid
+                    log.info("DeepL glossary created: %s", gid)
+                    return gid
+    except Exception as e:
+        log.warning("DeepL glossary create failed: %s", e)
+    return None
+
+
+async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
+    if not text.strip():
+        return text
+    if not TRANSLATE or not DEEPL_API_KEY:
+        return text
+    # ✅ opción A: si ya es inglés y no forzamos, se deja tal cual
+    if not FORCE_TRANSLATE and probably_english(text):
         return text
 
-    out = postprocess_translation(out, url_map)
+    gid = _glossary_id_mem or GLOSSARY_ID or ""
+    if not gid and (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV):
+        try:
+            gid = await deepl_create_glossary_if_needed() or ""
+        except Exception:
+            gid = ""
 
-    # Extra safety: ensure URL never glues to previous token
-    out = re.sub(r"(?<!\s)(https?://)", r" \1", out)
-    # Normalize weird double spaces created by protection/restoration
-    out = re.sub(r"[ \t]{3,}", "  ", out)
-    return out
+    text2, _url_ph = preprocess_for_translation(text)
+    # Extra: ayuda a DeepL con encabezados típicos para evitar salidas raras
+    if TARGET_LANG.upper() == 'EN':
+        text2 = re.sub(r'^\s*Importante\s*:', 'Important:', text2, flags=re.I|re.M)
 
+    url = f"https://{DEEPL_API_HOST}/v2/translate"
+    data = {
+        "auth_key": DEEPL_API_KEY,
+        "text": text2,
+        "source_lang": SOURCE_LANG,
+        "target_lang": TARGET_LANG,
+    }
+    if TARGET_LANG in DEEPL_FORMALITY_LANGS:
+        data["formality"] = FORMALITY
+    if gid:
+        data["glossary_id"] = gid
+
+    async with session.post(url, data=data) as r:
+        b = await r.text()
+        if r.status != 200:
+            log.warning("DeepL HTTP %s: %s", r.status, b)
+            return text
+        js = await r.json()
+        out = js["translations"][0]["text"]
+        return postprocess_translation(out, _url_ph)
+
+# ================== OPENAI STT/TTS (AUDIO) ==================
 async def openai_transcribe(audio_bytes: bytes, filename: str, mime: str, *, language_hint: str) -> str:
     """
     Speech-to-text con OpenAI (Whisper). Devuelve texto en el idioma original.
@@ -473,42 +599,23 @@ async def replicate_audio_with_translation(
         await copy_with_caption(context, dest_chat_id, dest_thread_id, src_msg, do_translate=False)
     return
 # ================== TRADUCCIÓN VISIBLE ==================
-async def translate_visible_html(text: str, entities, *, session: aiohttp.ClientSession | None = None):
-    """Translate message keeping Telegram HTML structure as clean as possible."""
-    _own_session = False
-    if session is None:
-        session = aiohttp.ClientSession()
-        _own_session = True
+async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
+    frags = entities_to_html(text, entities or [])
+    timeout = aiohttp.ClientTimeout(total=45)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        new_frags: List[Tuple[str, Dict[str, Any]]] = []
+        for frag, meta in frags:
+            if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
+                new_text = await deepl_translate(frag, session=session)
+                new_frags.append((new_text, meta))
+            else:
+                new_frags.append((frag, meta))
+    html_text = build_html(new_frags)
+    return html_text, []
 
-    try:
-        html_in = build_html_no_translate(text or "", entities or [])
 
-        # Protect HTML tags so DeepL only touches visible text.
-        tags = {}
-        def _tag_repl(m):
-            key = f"⟦TAG{len(tags)}⟧"
-            tags[key] = m.group(0)
-            return key
-
-        protected = re.sub(r"<[^>]+>", _tag_repl, html_in)
-
-        # If it already looks English, skip (but be conservative: Spanish accents/stopwords force translate)
-        low = (text or "").lower()
-        has_spanish = any(w in low for w in [" que ", " para ", " con ", " sin ", " hoy", " mañana", "ú", "á", "é", "í", "ó", "ñ", "únete", "quieres"])
-        if (not has_spanish) and probably_english(text or ""):
-            out = html_in
-        else:
-            out_txt = await deepl_translate(protected, session=session, source_lang="ES", target_lang="EN")
-            out = out_txt
-
-        # Restore tags
-        for k, v in tags.items():
-            out = out.replace(k, v)
-
-        return out, []
-    finally:
-        if _own_session:
-            await session.close()
+def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
+    return build_html(entities_to_html(text, entities or []))
 
 
 async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_translate: bool) -> Optional[InlineKeyboardMarkup]:

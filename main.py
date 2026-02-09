@@ -217,53 +217,68 @@ def _restore_urls(text: str, placeholders: dict) -> str:
         text = text.replace(ph, url)
     return text
 
-def preprocess_for_translation(text: str) -> tuple[str, dict[str, str]]:
-    """Preprocesado **mínimo y seguro**:
-    - Protege URLs para que DeepL no las rompa ni las pegue al texto.
-    - No toca emojis ni cambia palabras (evita artefactos tipo '¿Quieresreceive').
-    - Conserva saltos de línea tal cual.
+def preprocess_for_translation(text: str) -> tuple[str, dict]:
+    """Prepara texto para DeepL SIN romper el formato de Telegram.
+    - Conserva saltos de línea
+    - Protege URLs con placeholders
+    - Limpia invisibles típicos
+    - Separa emojis pegados a letras/números para evitar traducciones raras
     """
     if not text:
         return text, {}
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Quitar invisibles típicos
+    t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
+    # Separar emojis (cuando están pegados a texto)
+    t = _EMOJI_JOIN_RE.sub(r"\1 \2", t)
+    t = _EMOJI_JOIN_RE2.sub(r"\1 \2", t)
+    # Fix typos
+    for rx, rep in _TYPO_FIXES:
+        t = rx.sub(rep, t)
+    # Proteger URLs
+    t, placeholders = _protect_urls(t)
 
-    # Quitar caracteres invisibles problemáticos
-    text = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", text)
+    # Normalizar espacios SOLO dentro de cada línea (no colapsar líneas)
+    lines = t.split("\n")
+    norm_lines = []
+    for line in lines:
+        if line == "":
+            norm_lines.append("")
+            continue
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        norm_lines.append(line)
+    t = "\n".join(norm_lines)
 
-    urls: dict[str, str] = {}
+    # Reducir exceso de saltos (máx 2 en fila)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t, placeholders
 
-    def _repl(m: re.Match) -> str:
-        ph = f"__URL_{len(urls)}__"
-        urls[ph] = m.group(0)
-        # asegurar separación para que no se pegue con palabras
-        return f"\n{ph}\n"
 
-    protected = _URL_RE.sub(_repl, text)
-    # Evitar líneas demasiado vacías por la protección
-    protected = re.sub(r"\n{3,}", "\n\n", protected)
-    return protected, urls
-
-def postprocess_translation(text: str, urls: dict[str, str]) -> str:
-    """Postprocesado mínimo:
-    - Restaura URLs exactamente.
-    - Mantiene saltos de línea.
-    - Arregla espacios raros sin 'inventar' palabras.
+def postprocess_translation(translated: str, placeholders: dict) -> str:
+    """Limpia salida de DeepL SIN romper formato.
+    - Restaura URLs
+    - Conserva saltos de línea
+    - Normaliza espacios por línea
     """
-    if not text:
-        return text
+    if not translated:
+        return translated
+    t = translated.replace("\r\n", "\n").replace("\r", "\n")
+    # Restaurar URLs primero (para no pegar texto luego)
+    t = _restore_urls(t, placeholders)
 
-    # Restaurar placeholders de URL
-    for ph, url in urls.items():
-        text = text.replace(ph, url)
+    lines = t.split("\n")
+    out_lines = []
+    for line in lines:
+        if line == "":
+            out_lines.append("")
+            continue
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        out_lines.append(line)
+    t = "\n".join(out_lines)
 
-    # Si DeepL pegó una URL a texto, forzamos salto de línea antes
-    text = re.sub(r"(?<!\n)(https?://)", r"\n\1", text)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t
 
-    # Limpieza suave de espacios (sin tocar \n)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"\n[ \t]+", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
 
 def probably_english(text: str) -> bool:
     if _ES_MARKERS.search(text):
@@ -446,6 +461,8 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         "auth_key": DEEPL_API_KEY,
         "text": text2,
         "source_lang": SOURCE_LANG,
+        "preserve_formatting": True,
+        "split_sentences": "nonewlines",
         "target_lang": TARGET_LANG,
     }
     if TARGET_LANG in DEEPL_FORMALITY_LANGS:

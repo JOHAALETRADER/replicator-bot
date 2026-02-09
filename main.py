@@ -1,3 +1,15 @@
+
+# === TRANSLATION CLEAN PATCH ===
+def clean_translation_text(t):
+    import re
+    if not isinstance(t, str):
+        return t
+    t = re.sub(r'\s+\n', '\n', t)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    t = re.sub(r'([^\n])https://', r'\1\nhttps://', t)
+    return t.strip()
+
+
 import os
 import html
 import logging
@@ -136,17 +148,17 @@ TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
 
 # ================== FAN-OUT OPCIONAL ==================
 FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
-    (G1, 129): [(G3, 3), (G3, 4096)],
+    (G1, 129): [(G3, 3), (G3, 4096)],  # ✅ fanout: ES a topic 3 y EN a topic 4096
     (G1, 2890): [(G3, 2), (G3, 4098)],
     (G1, 17373): [(G3, 2), (G3, 4098)],
 }
 
 # ================== OVERRIDE DE TRADUCCIÓN POR RUTA ==================
 NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
+    (G1, 129, G3, 3),  # ✅ fanout ES sin traducir
     # G1 → G3#2 en ES
     (G1, 2890, G3, 2),
-    (G1, 17373, G3, 2),    (G1, 129, G3, 3),
-
+    (G1, 17373, G3, 2),
 }
 
 # ================== ANTI-LOOP: NO replicar desde destinos ==================
@@ -187,83 +199,177 @@ _EN_COMMON = re.compile(
     r"\b(the|and|for|with|from|to|of|in|on|is|are|you|we|they|buy|sell|trade|signal|profit|setup|account)\b",
     re.I
 )
-_ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
+# ================== TRANSLATION QUALITY PATCH (SAFE) ==================
+# Solo mejora la calidad del texto enviado a DeepL y el texto traducido.
+# No cambia rutas, fanouts, ni lógica de replicación.
 
+_URL_RE = re.compile(r"https?://\S+")
+# Separar emojis pegados a palabras (evita cosas tipo "Gracias❤️por" o "live📈")
+_EMOJI_JOIN_RE = re.compile(r"([\wÁÉÍÓÚÑáéíóúñ])([\U0001F300-\U0001FAFF\u2600-\u27BF])", re.UNICODE)
+_EMOJI_JOIN_RE2 = re.compile(r"([\U0001F300-\U0001FAFF\u2600-\u27BF])([\wÁÉÍÓÚÑáéíóúñ])", re.UNICODE)
+
+# Typos comunes vistos en tu contenido (solo para pruebas / limpieza)
+_TYPO_FIXES = [
+    (re.compile(r"\bGhank\b", re.I), "Thank"),
+    (re.compile(r"\bforsatechnical\b", re.I), "technical"),
+    (re.compile(r"\bforsatechnical\s+analysis\b", re.I), "technical analysis"),
+]
+
+def _protect_urls(text: str) -> tuple[str, dict]:
+    """Replace URLs with placeholders (surrounded by spaces) so DeepL doesn't glue text around them."""
+    urls = _URL_RE.findall(text or "")
+    placeholders: dict[str, str] = {}
+    for i, url in enumerate(urls):
+        ph = f"__URL{i}__"
+        # Surround with spaces so it stays separated from adjacent words/punctuation.
+        text = text.replace(url, f" {ph} ")
+        placeholders[ph] = url
+    return text, placeholders
+
+def _restore_urls(text: str, placeholders: dict) -> str:
+    for ph, url in (placeholders or {}).items():
+        text = text.replace(ph, url)
+    return text
+
+def _protect_html_tags(text: str) -> tuple[str, dict]:
+    """Protect HTML tags (<b>, <i>, <u>, <a href=...>, etc.) so translators don't break them."""
+    if not text:
+        return text, {}
+    tags = re.findall(r"</?[^>]+?>", text)
+    placeholders: dict[str, str] = {}
+    for i, tag in enumerate(tags):
+        ph = f"__TAG{i}__"
+        text = text.replace(tag, ph)
+        placeholders[ph] = tag
+    return text, placeholders
+
+def _restore_html_tags(text: str, placeholders: dict) -> str:
+    for ph, tag in (placeholders or {}).items():
+        text = text.replace(ph, tag)
+    return text
+
+def preprocess_for_translation(text: str) -> tuple[str, dict]:
+    """
+    Preprocess to improve DeepL output while keeping:
+    - ✅ saltos de línea
+    - ✅ emojis
+    - ✅ tags HTML (b/i/u/a)
+    - ✅ URLs (sin pegarse a palabras)
+    """
+    if not text:
+        return text, {}
+
+    t = text
+
+    # Quitar invisibles típicos
+    t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
+
+    # Proteger tags HTML (para no romper <b>...</b>, <a href=...>, etc.)
+    t, tag_ph = _protect_html_tags(t)
+
+    # Separar emojis pegados a palabras
+    t = _EMOJI_JOIN_RE.sub(r"\1 \2", t)
+    t = _EMOJI_JOIN_RE2.sub(r"\1 \2", t)
+
+    # Fix typos conocidos que generan traducciones raras
+    for rx, rep in _TYPO_FIXES:
+        t = rx.sub(rep, t)
+
+    # Proteger URLs (con espacios alrededor)
+    t, url_ph = _protect_urls(t)
+
+    # Normalizar saltos de línea y "congelarlos" para que DeepL los respete
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = t
+
+    # Normalizar espacios (sin tocar los )
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"(?:\s*){2,}", "", t).strip()
+
+    placeholders: dict[str, str] = {}
+    placeholders.update(tag_ph)
+    placeholders.update(url_ph)
+    return t, placeholders
+
+def postprocess_translation(text: str, placeholders: dict) -> str:
+    """Restore placeholders + fix the most common DeepL/Telegram artifacts.
+
+    Goals:
+    - ✅ mantener saltos de línea
+    - ✅ URLs nunca pegadas
+    - ✅ no romper HTML básico
+    - ✅ eliminar tokens raros (NL/NLL)
+    - ✅ micro-postedición para copy más natural (sin reescribir el mensaje)
+    """
+    if not text:
+        return text
+
+    t = text
+
+    # 1) Normalizar tokens de salto de línea que a veces DeepL altera
+    #    Ej: _NLL__, __NLL__, __ NL __, _ nl _, etc.
+    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*L\s*(?:__|_)+", "", t)
+    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*(?:__|_)+", "", t)
+
+    # 2) Restaurar saltos (antes de restaurar placeholders, para conservar formato)
+    t = t
+
+    # 3) Restaurar tags HTML y URLs
+    t = _restore_html_tags(t, placeholders)
+    t = _restore_urls(t, placeholders)
+
+    # 4) Evitar que URLs se peguen (casos VIP:https://...Resultados / ...JTTRADERSReal)
+    #    - si un URL viene pegado a letra/número -> separa por salto de línea
+    t = t
+    t = t
+
+    # 5) Si el URL está en una línea con texto justo antes del : sin espacio, lo acomoda
+    t = t
+
+    # 6) Limpiar artefactos tipo \1 \2 si por algún motivo se filtraron
+    t = t.replace("\\1", "").replace("\\2", "")
+
+    # 7) Micro post-edición (solo correcciones seguras y muy frecuentes)
+    #    (No reescribe el copy; solo quita rarezas/mezclas)
+    fixes = [
+        (re.compile(r"\bforsatechnical\b", re.I), "technical"),
+        (re.compile(r"\bGhank\b", re.I), "Thank"),
+        (re.compile(r"\bconnect to live\b", re.I), "go live"),
+        (re.compile(r"\bdo live\b", re.I), "go live"),
+        (re.compile(r"\bMattersnte\s*:", re.I), "Important:"),
+        (re.compile(r"\bpara\s+that\b", re.I), "so that"),
+        (re.compile(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", re.I), r"for \1"),
+        (re.compile(r"\bpor\s+patience\b", re.I), "for your patience"),
+
+        # Tokens/pegues típicos reportados
+        (re.compile(r"\bTheidea\b", re.I), "The idea"),
+        (re.compile(r"\bEsoperate\b", re.I), "Operate"),
+        (re.compile(r"\bOclear\b", re.I), "Clear"),
+        (re.compile(r"\bGprofessional\b", re.I), "Professional"),
+
+        # Trading copy: Bitácora -> trading journal (cuando queda en inglés)
+        (re.compile(r"\bBitacora\b", re.I), "Trading journal"),
+    ]
+    for rx, rep in fixes:
+        t = rx.sub(rep, t)
+
+    # 8) Normalizar espacios por línea (sin destruir saltos)
+    t = "\n".join([re.sub(r"[ \t]+", " ", ln).rstrip() for ln in t.split("\n")])
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
+    return t
 
 def probably_english(text: str) -> bool:
-    """Heurística conservadora: solo 'no traducir' si es claramente inglés.
-    Evita falsos positivos en textos de trading (mezcla ES/EN, emojis, links)."""
-    t = (text or "").strip()
-    if not t:
+    if _ES_MARKERS.search(text):
         return False
-    # Si hay marcadores de español, NO es inglés.
-    if _ES_MARKERS.search(t):
-        return False
-
-    # Cuenta palabras comunes en inglés. Exige varias coincidencias para considerarlo inglés.
-    en_hits = len(_EN_COMMON.findall(t))
-    if en_hits >= 4 and len(t) >= 40:
+    if _EN_COMMON.search(text):
         return True
-
-    # Ratio de letras ASCII: también exige longitud suficiente.
-    letters = [c for c in t if c.isalpha()]
-    if len(letters) < 20:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
         return False
     ascii_letters = [c for c in letters if ord(c) < 128]
-    return (len(ascii_letters) / max(1, len(letters))) > 0.95
+    return (len(ascii_letters) / max(1, len(letters))) > 0.85
 
-
-# ================== PRE/POST PROCESO DE TRADUCCIÓN ==================
-_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
-_URL_RE = re.compile(r"(https?://\S+|tg://\S+)", re.I)
-
-# Emojis comunes de tu comunidad (evita pegados raros)
-_EMOJI_CHARS = "❤️🔥📈🙏💻⚡📊🚀💯😎👀🤖😅✅❌👉👇⬇️⬆️⭐✨🎯💸📉🧠🖥️"
-_EMOJI_EDGE_RE = re.compile(rf"(\w)([{re.escape(_EMOJI_CHARS)}])|([{re.escape(_EMOJI_CHARS)}])(\w)")
-
-def _normalize_for_translation(text: str) -> str:
-    import unicodedata
-    t = unicodedata.normalize("NFKC", text or "")
-    t = _ZERO_WIDTH_RE.sub("", t)
-    # Asegura espacios alrededor de emojis comunes
-    def _space_em(m: re.Match) -> str:
-        if m.group(1) and m.group(2):
-            return f"{m.group(1)} {m.group(2)}"
-        if m.group(3) and m.group(4):
-            return f"{m.group(3)} {m.group(4)}"
-        return m.group(0)
-    t = _EMOJI_EDGE_RE.sub(_space_em, t)
-    # Compacta espacios
-    t = re.sub(r"[ \t]{2,}", " ", t)
-    return t.strip()
-
-def _protect_urls(text: str) -> tuple[str, list[str]]:
-    urls: list[str] = []
-    def _repl(m: re.Match) -> str:
-        urls.append(m.group(0))
-        return f"__URL{len(urls)-1}__"
-    return _URL_RE.sub(_repl, text), urls
-
-def _restore_urls(text: str, urls: list[str]) -> str:
-    out = text
-    for i, u in enumerate(urls):
-        out = out.replace(f"__URL{i}__", u)
-    return out
-
-def _postprocess_en(text: str) -> str:
-    t = (text or "")
-    # Elimina artefactos típicos si llegaran a colarse
-    t = t.replace("\\1", "").replace("\\2", "")
-    t = t.replace("Ghank", "Thank").replace("ghank", "thank")
-    t = t.replace("MaSee", "See").replace("maSee", "see")
-    # Frases naturales para tu contexto
-    t = t.replace("connect to live", "go live")
-    t = t.replace("connect to the live", "go live")
-    t = t.replace("I will not be able to go live today.", "I won’t be going live today.")
-    t = t.replace("I will not be able to go live today", "I won’t be going live today")
-    # Limpieza final de espacios
-    t = re.sub(r"[ \t]{2,}", " ", t).strip()
-    return t
 
 # ================== ENTIDADES HTML ==================
 SAFE_TAGS = {"b", "strong", "i", "em", "u", "s", "del", "code", "pre", "a"}
@@ -408,23 +514,14 @@ async def deepl_create_glossary_if_needed() -> Optional[str]:
     return None
 
 
-async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
-    """Traduce con DeepL con limpieza previa y post-proceso suave.
-    Si DeepL falla, devuelve el texto original (para que NUNCA se caiga la réplica)."""
-    raw = text or ""
-    if not raw.strip():
-        return raw
+async def clean_translation_text(deepl_translate(text: str, *, session: aiohttp.ClientSession)) -> str:
+    if not text.strip():
+        return text
     if not TRANSLATE or not DEEPL_API_KEY:
-        return raw
-
-    clean = _normalize_for_translation(raw)
-
-    # Si no forzamos y es claramente inglés, no traducimos.
-    if not FORCE_TRANSLATE and probably_english(clean):
-        return clean
-
-    # Protege URLs para que DeepL no las “rompa”
-    protected, urls = _protect_urls(clean)
+        return text
+    # ✅ opción A: si ya es inglés y no forzamos, se deja tal cual
+    if not FORCE_TRANSLATE and probably_english(text):
+        return text
 
     gid = _glossary_id_mem or GLOSSARY_ID or ""
     if not gid and (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV):
@@ -433,37 +530,32 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         except Exception:
             gid = ""
 
+    text2, _url_ph = preprocess_for_translation(text)
+    # Extra: ayuda a DeepL con encabezados típicos para evitar salidas raras
+    if TARGET_LANG.upper() == 'EN':
+        text2 = re.sub(r'^\s*Importante\s*:', 'Important:', text2, flags=re.I|re.M)
+
     url = f"https://{DEEPL_API_HOST}/v2/translate"
     data = {
         "auth_key": DEEPL_API_KEY,
-        "text": protected,
+        "text": text2,
         "source_lang": SOURCE_LANG,
         "target_lang": TARGET_LANG,
+        "preserve_formatting": 1,
     }
     if TARGET_LANG in DEEPL_FORMALITY_LANGS:
         data["formality"] = FORMALITY
     if gid:
         data["glossary_id"] = gid
 
-    try:
-        async with session.post(url, data=data) as r:
-            if r.status != 200:
-                b = await r.text()
-                log.warning("DeepL HTTP %s: %s", r.status, b)
-                return clean
-            js = await r.json()
-            out = js["translations"][0]["text"]
-    except Exception as e:
-        log.warning("DeepL exception: %s", e)
-        return clean
-
-    out = _restore_urls(out, urls)
-
-    # Post-proceso SOLO para inglés objetivo
-    if (TARGET_LANG or "").upper().startswith("EN"):
-        out = _postprocess_en(out)
-
-    return out
+    async with session.post(url, data=data) as r:
+        b = await r.text()
+        if r.status != 200:
+            log.warning("DeepL HTTP %s: %s", r.status, b)
+            return text
+        js = await r.json()
+        out = js["translations"][0]["text"]
+        return postprocess_translation(out, _url_ph)
 
 # ================== OPENAI STT/TTS (AUDIO) ==================
 async def openai_transcribe(audio_bytes: bytes, filename: str, mime: str, *, language_hint: str) -> str:
@@ -580,7 +672,7 @@ async def replicate_audio_with_translation(
         try:
             timeout = aiohttp.ClientTimeout(total=45)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                caption_text = await deepl_translate(transcript.strip(), session=session)
+                caption_text = await clean_translation_text(deepl_translate(transcript.strip()), session=session)
         except Exception as e:
             log.warning("Audio translate text failed (msg %s): %s", src_msg.message_id, e)
             caption_text = ""
@@ -609,30 +701,18 @@ async def replicate_audio_with_translation(
     return
 # ================== TRADUCCIÓN VISIBLE ==================
 async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
-    """Traduce el mensaje completo preservando formato básico (HTML).
-    Evita traducciones fragmentadas que mezclan ES/EN."""
-    # Construye HTML seguro desde entidades
-    frags = entities_to_html(text or "", entities or [])
-    html_src = build_html(frags)
-
-    # Protege tags HTML para que DeepL no los toque
-    tags: list[str] = []
-    def _tag_repl(m: re.Match) -> str:
-        tags.append(m.group(0))
-        return f"__TAG{len(tags)-1}__"
-
-    protected = re.sub(r"</?[^>]+>", _tag_repl, html_src)
-
+    frags = entities_to_html(text, entities or [])
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        translated = await deepl_translate(protected, session=session)
-
-    # Restaura tags
-    out = translated
-    for i, tag in enumerate(tags):
-        out = out.replace(f"__TAG{i}__", tag)
-
-    return out, []
+        new_frags: List[Tuple[str, Dict[str, Any]]] = []
+        for frag, meta in frags:
+            if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
+                new_text = await clean_translation_text(deepl_translate(frag, session=session))
+                new_frags.append((new_text, meta))
+            else:
+                new_frags.append((frag, meta))
+    html_text = build_html(new_frags)
+    return html_text, []
 
 
 def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
@@ -650,7 +730,7 @@ async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_transl
         for row in markup.inline_keyboard:
             new_row: List[InlineKeyboardButton] = []
             for b in row:
-                label = await deepl_translate(b.text or "", session=session)
+                label = await clean_translation_text(deepl_translate(b.text or "", session=session))
                 new_row.append(
                     InlineKeyboardButton(
                         text=(label or "")[:64],
@@ -1105,19 +1185,6 @@ async def replicate_message(
         reply_to_id = resolve_reply_to_id(src_msg, dest_chat_id)
 
     
-
-    # Para ciertas rutas de fanout (especialmente topics), no queremos “reply” automático.
-    # Esto evita el error visual de responder a una foto/mensaje ancla.
-    try:
-        src_thread = getattr(src_msg, "message_thread_id", None) or 1
-        if src_msg.chat.id == G1 and src_thread == 129 and isinstance(dest_chat_id, int) and dest_chat_id == G3 and dest_thread_id in (3, 4096):
-            reply_to_id = None
-        if src_msg.chat.id == G1 and src_thread == 129 and isinstance(dest_chat_id, int) and dest_chat_id == G4 and dest_thread_id == 8:
-            reply_to_id = None
-    except Exception:
-        pass
-
-
     # --- AUDIO: transcribir + traducir + reenviar como audio EN + texto EN ---
     if (getattr(src_msg, "voice", None) or getattr(src_msg, "audio", None)):
         try:

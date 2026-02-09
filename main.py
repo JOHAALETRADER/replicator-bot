@@ -280,49 +280,72 @@ def preprocess_for_translation(text: str) -> tuple[str, dict]:
     return t, placeholders
 
 def postprocess_translation(text: str, placeholders: dict) -> str:
+    """Restore placeholders + fix the most common DeepL/Telegram artifacts.
+
+    Goals:
+    - ✅ mantener saltos de línea
+    - ✅ URLs nunca pegadas
+    - ✅ no romper HTML básico
+    - ✅ eliminar tokens raros (NL/NLL)
+    - ✅ micro-postedición para copy más natural (sin reescribir el mensaje)
+    """
     if not text:
         return text
+
     t = text
 
-    # Normalizar tokens de salto de línea que a veces DeepL altera (ej: _NLL__, __NLL__, __ NL __)
-    # Esto evita que se vean artefactos como "_NLL__" en el mensaje final.
-    t = re.sub(r"[_]{1,2}\s*NLL\s*[_]{1,2}", "__NL__", t, flags=re.I)
-    t = re.sub(r"[_]{1,2}\s*NL\s*[_]{1,2}", "__NL__", t, flags=re.I)
-    t = re.sub(r"__\s*NLL\s*__", "__NL__", t, flags=re.I)
-    t = re.sub(r"__\s*NL\s*__", "__NL__", t, flags=re.I)
+    # 1) Normalizar tokens de salto de línea que a veces DeepL altera
+    #    Ej: _NLL__, __NLL__, __ NL __, _ nl _, etc.
+    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*L\s*(?:__|_)+", "__NL__", t)
+    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*(?:__|_)+", "__NL__", t)
 
-    # Restaurar saltos de línea
+    # 2) Restaurar saltos (antes de restaurar placeholders, para conservar formato)
     t = t.replace("__NL__", "\n")
 
-    # Restaurar HTML tags y URLs
+    # 3) Restaurar tags HTML y URLs
     t = _restore_html_tags(t, placeholders)
     t = _restore_urls(t, placeholders)
 
-    # Evitar que el URL se pegue con palabras (VIP:https://...Resultados)
-    t = re.sub(r"(https?://\S+)([A-Za-z0-9])", r"\1\n\2", t)
-    t = re.sub(r"([A-Za-z0-9])\s*(https?://)", r"\1\n\2", t)
+    # 4) Evitar que URLs se peguen (casos VIP:https://...Resultados / ...JTTRADERSReal)
+    #    - si un URL viene pegado a letra/número -> separa por salto de línea
+    t = re.sub(r"(https?://\S+?)(?=[A-Za-z0-9])", r"\1\n", t)
+    t = re.sub(r"(?<=[A-Za-z0-9])\s*(https?://)", r"\n\1", t)
 
-    # Limpiar artefactos tipo \1 \2 si aparecieran por accidente
+    # 5) Si el URL está en una línea con texto justo antes del : sin espacio, lo acomoda
+    t = re.sub(r":\s*(https?://)", r":\n\1", t)
+
+    # 6) Limpiar artefactos tipo \1 \2 si por algún motivo se filtraron
     t = t.replace("\\1", "").replace("\\2", "")
 
-    # Ajustes mínimos para inglés más natural (trading/community)
-    t = re.sub(r"\bconnect to live\b", "go live", t, flags=re.I)
-    t = re.sub(r"\bcontinue growing together on this path\b", "keep growing together on this journey", t, flags=re.I)
+    # 7) Micro post-edición (solo correcciones seguras y muy frecuentes)
+    #    (No reescribe el copy; solo quita rarezas/mezclas)
+    fixes = [
+        (re.compile(r"\bforsatechnical\b", re.I), "technical"),
+        (re.compile(r"\bGhank\b", re.I), "Thank"),
+        (re.compile(r"\bconnect to live\b", re.I), "go live"),
+        (re.compile(r"\bdo live\b", re.I), "go live"),
+        (re.compile(r"\bMattersnte\s*:", re.I), "Important:"),
+        (re.compile(r"\bpara\s+that\b", re.I), "so that"),
+        (re.compile(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", re.I), r"for \1"),
+        (re.compile(r"\bpor\s+patience\b", re.I), "for your patience"),
 
-    # Arreglos anti-mezcla ES->EN (conectores típicos que a veces quedan sin traducir)
-    t = re.sub(r"\bMattersnte\s*:", "Important:", t, flags=re.I)
-    t = re.sub(r"\bpara\s+that\b", "so that", t, flags=re.I)
-    t = re.sub(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", r"for \1", t, flags=re.I)
-    t = re.sub(r"\bpor\s+patience\b", "for your patience", t, flags=re.I)
+        # Tokens/pegues típicos reportados
+        (re.compile(r"\bTheidea\b", re.I), "The idea"),
+        (re.compile(r"\bEsoperate\b", re.I), "Operate"),
+        (re.compile(r"\bOclear\b", re.I), "Clear"),
+        (re.compile(r"\bGprofessional\b", re.I), "Professional"),
 
-    # Normalizar espacios (manteniendo saltos)
-    t = re.sub(r"[ \t]+", " ", t)
+        # Trading copy: Bitácora -> trading journal (cuando queda en inglés)
+        (re.compile(r"\bBitacora\b", re.I), "Trading journal"),
+    ]
+    for rx, rep in fixes:
+        t = rx.sub(rep, t)
+
+    # 8) Normalizar espacios por línea (sin destruir saltos)
+    t = "\n".join([re.sub(r"[ \t]+", " ", ln).rstrip() for ln in t.split("\n")])
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
     return t
-
-# ================== END TRANSLATION QUALITY PATCH ==================
-_ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
-
 
 def probably_english(text: str) -> bool:
     if _ES_MARKERS.search(text):

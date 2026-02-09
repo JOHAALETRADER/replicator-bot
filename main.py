@@ -217,49 +217,46 @@ def _restore_urls(text: str, placeholders: dict) -> str:
         text = text.replace(ph, url)
     return text
 
-def preprocess_for_translation(text: str) -> tuple[str, list[str]]:
-    """Prepare text for translation without destroying Telegram formatting.
-    We only protect URLs so DeepL won't alter them.
-    We *do not* replace spaces/newlines (those tricks were causing words to merge
-    when DeepL removed or changed placeholder characters).
-    """
+def preprocess_for_translation(text: str) -> tuple[str, dict]:
     if not text:
-        return "", []
+        return text, {}
+    t = text
+    # Quitar invisibles típicos
+    t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
+    # Separar emojis
+    t = _EMOJI_JOIN_RE.sub(r"\1 \2", t)
+    t = _EMOJI_JOIN_RE2.sub(r"\1 \2", t)
+    # Fix typos
+    for rx, rep in _TYPO_FIXES:
+        t = rx.sub(rep, t)
+    # Proteger URLs
+    t, placeholders = _protect_urls(t)
+    # Normalizar espacios
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n\s*\n\s*\n+", "\n\n", t).strip()
+    return t, placeholders
 
-    # Normalize line endings
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    urls: list[str] = []
-
-    def _repl(m: re.Match) -> str:
-        urls.append(m.group(0))
-        return f"__URL{len(urls)-1}__"
-
-    safe_text = URL_RE.sub(_repl, text)
-    return safe_text, urls
-
-
-def postprocess_translation(translated: str, urls: list[str]) -> str:
-    """Restore URLs and do minimal cleanup, keeping Telegram-ready text."""
-    if not translated:
-        return ""
-
-    text = translated
-
-    # Restore URL placeholders
-    for i, url in enumerate(urls or []):
-        text = text.replace(f"__URL{i}__", url)
-
-    # Fix cases where a URL got glued to letters/numbers
-    text = re.sub(r"(?<=\w)(https?://)", r" \1", text)
-    text = re.sub(r"(https?://\S+)(?=\w)", r"\1 ", text)
-
-    # Normalize weird non-breaking spaces DeepL sometimes returns
-    text = text.replace("\u00a0", " ")
-
-    # Do NOT collapse newlines; just trim trailing spaces per line
-    text = "\n".join(line.rstrip() for line in text.split("\n"))
-    return text.strip()
+def postprocess_translation(text: str, placeholders: dict) -> str:
+    if not text:
+        return text
+    t = text
+    # Reponer URLs
+    t = _restore_urls(t, placeholders)
+    # Limpiar artefactos tipo \1 \2 si aparecieran por accidente
+    t = t.replace("\\1", "").replace("\\2", "")
+    # Ajustes mínimos para inglés más natural (trading/community)
+    t = re.sub(r"\bconnect to live\b", "go live", t, flags=re.I)
+    t = re.sub(r"\bcontinue growing together on this path\b", "keep growing together on this journey", t, flags=re.I)
+    # Arreglos anti-mezcla ES->EN (conectores típicos que a veces quedan sin traducir)
+    t = re.sub(r"\bMattersnte\s*:", "Important:", t, flags=re.I)
+    t = re.sub(r"\bpara\s+that\b", "so that", t, flags=re.I)
+    t = re.sub(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", r"for \1", t, flags=re.I)
+    t = re.sub(r"\bpor\s+patience\b", "for your patience", t, flags=re.I)
+    # Normalizar espacios
+    t = re.sub(r"[ \t]+", " ", t).strip()
+    return t
+# ================== END TRANSLATION QUALITY PATCH ==================
+_ES_MARKERS = re.compile(r"[áéíóúñ¿¡]|\b(que|para|porque|hola|gracias|compra|venta|señal|apalancamiento|beneficios)\b", re.I)
 
 
 def probably_english(text: str) -> bool:
@@ -440,19 +437,11 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
 
     url = f"https://{DEEPL_API_HOST}/v2/translate"
     data = {
-        "text": text_pre,
-        "target_lang": target_lang,
-        # If you KNOW your source is always Spanish, set SOURCE_LANG=ES in Railway.
-        "source_lang": os.getenv("SOURCE_LANG", "").strip() or None,
-        # Keep formatting and avoid joining lines
-        "preserve_formatting": "1",
-        "split_sentences": "nonewlines",
-        # Keep Telegram HTML tags intact if present (e.g., <b>...</b>)
-        "tag_handling": "html",
+        "auth_key": DEEPL_API_KEY,
+        "text": text2,
+        "source_lang": SOURCE_LANG,
+        "target_lang": TARGET_LANG,
     }
-    if not data["source_lang"]:
-        data.pop("source_lang", None)
-
     if TARGET_LANG in DEEPL_FORMALITY_LANGS:
         data["formality"] = FORMALITY
     if gid:

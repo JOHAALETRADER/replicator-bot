@@ -285,50 +285,52 @@ def postprocess_translation(text: str, url_map: dict):
 
     return t
 
-async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
-    if not text.strip():
-        return text
-    if not TRANSLATE or not DEEPL_API_KEY:
-        return text
-    # ✅ opción A: si ya es inglés y no forzamos, se deja tal cual
-    if not FORCE_TRANSLATE and probably_english(text):
+async def deepl_translate(text: str, *, session: aiohttp.ClientSession, source_lang: str = "ES", target_lang: str = "EN") -> str:
+    """DeepL translation with minimal safe preprocessing: preserve URLs, emojis, and line breaks."""
+    global _glossary_id_mem
+
+    auth = (os.getenv("DEEPL_API_KEY") or os.getenv("DEEPL_AUTH_KEY") or "").strip()
+    if not auth:
+        # If no API key, return original text (fail-open)
         return text
 
-    gid = _glossary_id_mem or GLOSSARY_ID or ""
-    if not gid and (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV):
-        try:
-            gid = await deepl_create_glossary_if_needed() or ""
-        except Exception:
-            gid = ""
+    # DeepL endpoint (free/pro)
+    base = os.getenv("DEEPL_API_URL", "").strip() or ("https://api-free.deepl.com" if auth.endswith(":fx") or auth.endswith(":FX") else "https://api.deepl.com")
+    url = base.rstrip("/") + "/v2/translate"
 
-    text2, _url_ph = preprocess_for_translation(text)
-    # Extra: ayuda a DeepL con encabezados típicos para evitar salidas raras
-    if TARGET_LANG.upper() == 'EN':
-        text2 = re.sub(r'^\s*Importante\s*:', 'Important:', text2, flags=re.I|re.M)
+    protected, url_map = preprocess_for_translation(text)
 
-    url = f"https://{DEEPL_API_HOST}/v2/translate"
+    # Cache (or create) glossary if possible
+    if _glossary_id_mem is None:
+        _glossary_id_mem = await deepl_create_glossary_if_needed(session)
+
     data = {
-        "auth_key": DEEPL_API_KEY,
-        "text": text2,
-        "source_lang": SOURCE_LANG,
-        "target_lang": TARGET_LANG,
-        "preserve_formatting": 1,
+        "text": protected,
+        "source_lang": source_lang,
+        "target_lang": target_lang,
+        "tag_handling": "xml",  # helps keep placeholders/tags stable
+        "preserve_formatting": "1",
     }
-    if TARGET_LANG in DEEPL_FORMALITY_LANGS:
-        data["formality"] = FORMALITY
-    if gid:
-        data["glossary_id"] = gid
+    if _glossary_id_mem:
+        data["glossary_id"] = _glossary_id_mem
 
-    async with session.post(url, data=data) as r:
-        b = await r.text()
-        if r.status != 200:
-            log.warning("DeepL HTTP %s: %s", r.status, b)
-            return text
-        js = await r.json()
-        out = js["translations"][0]["text"]
-        return postprocess_translation(out, _url_ph)
+    try:
+        async with session.post(url, data=data, headers={"Authorization": f"DeepL-Auth-Key {auth}"}, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+            if resp.status >= 400:
+                return text
+            j = await resp.json()
+            out = (j.get("translations") or [{}])[0].get("text") or ""
+    except Exception:
+        return text
 
-# ================== OPENAI STT/TTS (AUDIO) ==================
+    out = postprocess_translation(out, url_map)
+
+    # Extra safety: ensure URL never glues to previous token
+    out = re.sub(r"(?<!\s)(https?://)", r" \1", out)
+    # Normalize weird double spaces created by protection/restoration
+    out = re.sub(r"[ \t]{3,}", "  ", out)
+    return out
+
 async def openai_transcribe(audio_bytes: bytes, filename: str, mime: str, *, language_hint: str) -> str:
     """
     Speech-to-text con OpenAI (Whisper). Devuelve texto en el idioma original.
@@ -472,30 +474,41 @@ async def replicate_audio_with_translation(
     return
 # ================== TRADUCCIÓN VISIBLE ==================
 async def translate_visible_html(text: str, entities, *, session: aiohttp.ClientSession | None = None):
+    """Translate message keeping Telegram HTML structure as clean as possible."""
     _own_session = False
     if session is None:
+        session = aiohttp.ClientSession()
         _own_session = True
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25))
-    try:
-        """Traducción *literal y limpia*.
-        Para evitar artefactos (NL_, palabras pegadas, emojis raros, etc.), traducimos el TEXTO PLANO completo.
-        - No tocamos rutas ni lógica
-        - No reconstruimos HTML/entidades (Telegram auto-linkea URLs)
-        """
-        if text is None:
-            return "", []
-        try:
-            out = await deepl_translate(text, session=session)
-            return out, []
-        except Exception as e:
-            log.warning("translate_visible_html fallo: %s", e)
-            return text, []
 
+    try:
+        html_in = build_html_no_translate(text or "", entities or [])
+
+        # Protect HTML tags so DeepL only touches visible text.
+        tags = {}
+        def _tag_repl(m):
+            key = f"⟦TAG{len(tags)}⟧"
+            tags[key] = m.group(0)
+            return key
+
+        protected = re.sub(r"<[^>]+>", _tag_repl, html_in)
+
+        # If it already looks English, skip (but be conservative: Spanish accents/stopwords force translate)
+        low = (text or "").lower()
+        has_spanish = any(w in low for w in [" que ", " para ", " con ", " sin ", " hoy", " mañana", "ú", "á", "é", "í", "ó", "ñ", "únete", "quieres"])
+        if (not has_spanish) and probably_english(text or ""):
+            out = html_in
+        else:
+            out_txt = await deepl_translate(protected, session=session, source_lang="ES", target_lang="EN")
+            out = out_txt
+
+        # Restore tags
+        for k, v in tags.items():
+            out = out.replace(k, v)
+
+        return out, []
     finally:
         if _own_session:
             await session.close()
-def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
-    return build_html(entities_to_html(text, entities or []))
 
 
 async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_translate: bool) -> Optional[InlineKeyboardMarkup]:

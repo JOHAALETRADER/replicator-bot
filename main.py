@@ -236,125 +236,59 @@ def _restore_html_tags(text: str, placeholders: dict) -> str:
         text = text.replace(ph, tag)
     return text
 
-def preprocess_for_translation(text: str) -> tuple[str, dict]:
+def preprocess_for_translation(text: str) -> tuple[str, dict[str, str]]:
     """
-    Preprocess to improve DeepL output while keeping:
-    - ✅ saltos de línea
-    - ✅ emojis
-    - ✅ tags HTML (b/i/u/a)
-    - ✅ URLs (sin pegarse a palabras)
+    Preprocesado *mínimo y seguro*:
+    - Mantiene saltos de línea reales (NO usamos tokens tipo NL__).
+    - Protege URLs para que DeepL no las “pegue” ni las altere.
+    Retorna: (texto_preparado, mapa_placeholders_url)
     """
-    if not text:
-        return text, {}
+    # Normaliza saltos de línea
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
 
-    t = text
+    # Protege URLs (DeepL a veces cambia espacios/partes del link)
+    url_map: dict[str, str] = {}
+    def _url_repl(m: re.Match) -> str:
+        key = f"__URL{len(url_map)}__"
+        url_map[key] = m.group(0)
+        return key
 
-    # Quitar invisibles típicos
-    t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
+    # Nota: detecta URLs comunes (http/https)
+    safe = re.sub(r"https?://\S+", _url_repl, text)
 
-    # Proteger tags HTML (para no romper <b>...</b>, <a href=...>, etc.)
-    t, tag_ph = _protect_html_tags(t)
-
-    # Separar emojis pegados a palabras
-    t = _EMOJI_JOIN_RE.sub(r"\1 \2", t)
-    t = _EMOJI_JOIN_RE2.sub(r"\1 \2", t)
-
-    # Fix typos conocidos que generan traducciones raras
-    for rx, rep in _TYPO_FIXES:
-        t = rx.sub(rep, t)
-
-    # Proteger URLs (con espacios alrededor)
-    t, url_ph = _protect_urls(t)
-
-    # Normalizar saltos de línea y "congelarlos" para que DeepL los respete
-    t = t.replace("\r\n", "\n").replace("\r", "\n")
-    t = t.replace("\n", "__NL__")
-
-    # Normalizar espacios (sin tocar los __NL__)
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"__NL__(?:\s*__NL__){2,}", "__NL____NL__", t).strip()
-
-    placeholders: dict[str, str] = {}
-    placeholders.update(tag_ph)
-    placeholders.update(url_ph)
-    return t, placeholders
-
-def postprocess_translation(text: str, placeholders: dict) -> str:
-    """Restore placeholders + fix the most common DeepL/Telegram artifacts.
-
-    Goals:
-    - ✅ mantener saltos de línea
-    - ✅ URLs nunca pegadas
-    - ✅ no romper HTML básico
-    - ✅ eliminar tokens raros (NL/NLL)
-    - ✅ micro-postedición para copy más natural (sin reescribir el mensaje)
+    return safe, url_map
+def postprocess_translation(text: str, url_map: dict[str, str]) -> str:
     """
-    if not text:
-        return text
+    Postproceso para dejar salida *limpia*:
+    - Restaura URLs protegidas
+    - Arregla casos típicos donde el link queda pegado a una palabra (VIPhttps://...)
+    - Elimina artefactos tipo NL__/__NL__ si aparecieran por mensajes antiguos
+    - Mantiene saltos de línea
+    """
+    out = text or ""
 
-    t = text
+    # 1) Quita artefactos de builds anteriores (por si llegan a colarse)
+    out = out.replace("__NL__", "\n")
+    # Remueve NL__ aunque esté pegado a letras (no usamos \b)
+    out = re.sub(r"NL\s*L?__", "", out, flags=re.I)
 
-    # 1) Normalizar tokens de salto de línea que a veces DeepL altera
-    #    Ej: _NLL__, __NLL__, __ NL __, _ nl _, etc.
-    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*L\s*(?:__|_)+", "__NL__", t)
-    t = re.sub(r"(?i)(?:__|_)+\s*N\s*L\s*(?:__|_)+", "__NL__", t)
+    # 2) Restaura URLs
+    for k, v in (url_map or {}).items():
+        out = out.replace(k, v)
 
-    # Variantes sin guiones bajos al inicio (ej: NL__I have..., NL__ Includes:)
-    t = re.sub(r"(?i)\bNL\s*L?\s*__\b", "__NL__", t)
-    t = re.sub(r"(?i)\bNL\s*L?\s*_\b", "__NL__", t)
+    # 3) Evita URL pegada (por ejemplo "VIP:https://..." o "VIPhttps://...")
+    out = re.sub(r"(?i)(\bVIP\b)\s*:\s*(https?://)", r"\1:\n\2", out)
+    out = re.sub(r"(?i)(\bVIP\b)\s+(https?://)", r"\1\n\2", out)
+    out = re.sub(r"(?i)(\bVIP\b)(https?://)", r"\1\n\2", out)
 
-    # 2) Restaurar saltos (antes de restaurar placeholders, para conservar formato)
-    t = t.replace("__NL__", "\n")
-    # Si quedó algún token suelto tipo NL__ o NLL__ (sin __ al inicio), elimínalo
-    t = re.sub(r"(?i)\bNLL?__\b", "", t)
-    t = re.sub(r"(?i)\bNLL?\b", "", t)
+    # Si cualquier palabra queda pegada justo antes de un http, mete un espacio (último recurso)
+    out = re.sub(r"([A-Za-z0-9])(?=https?://)", r"\1\n", out)
 
+    # 4) Limpieza de espacios raros
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{4,}", "\n\n\n", out)  # no más de 3 saltos seguidos
 
-    # 3) Restaurar tags HTML y URLs
-    t = _restore_html_tags(t, placeholders)
-    t = _restore_urls(t, placeholders)
-
-    # 4) Evitar que URLs se peguen (casos VIP:https://...Resultados / ...JTTRADERSReal)
-    #    - si un URL viene pegado a letra/número -> separa por salto de línea
-    t = re.sub(r"(https?://\S+?)(?=[A-Za-z0-9])", r"\1\n", t)
-    t = re.sub(r"(?<=[A-Za-z0-9])\s*(https?://)", r"\n\1", t)
-
-    # 5) Si el URL está en una línea con texto justo antes del : sin espacio, lo acomoda
-    t = re.sub(r":\s*(https?://)", r":\n\1", t)
-
-    # 6) Limpiar artefactos tipo \1 \2 si por algún motivo se filtraron
-    t = t.replace("\\1", "").replace("\\2", "")
-
-    # 7) Micro post-edición (solo correcciones seguras y muy frecuentes)
-    #    (No reescribe el copy; solo quita rarezas/mezclas)
-    fixes = [
-        (re.compile(r"\bforsatechnical\b", re.I), "technical"),
-        (re.compile(r"\bGhank\b", re.I), "Thank"),
-        (re.compile(r"\bconnect to live\b", re.I), "go live"),
-        (re.compile(r"\bdo live\b", re.I), "go live"),
-        (re.compile(r"\bMattersnte\s*:", re.I), "Important:"),
-        (re.compile(r"\bpara\s+that\b", re.I), "so that"),
-        (re.compile(r"\bpor\s+(the|your|my|our|this|that|all|a|an)\b", re.I), r"for \1"),
-        (re.compile(r"\bpor\s+patience\b", re.I), "for your patience"),
-
-        # Tokens/pegues típicos reportados
-        (re.compile(r"\bTheidea\b", re.I), "The idea"),
-        (re.compile(r"\bEsoperate\b", re.I), "Operate"),
-        (re.compile(r"\bOclear\b", re.I), "Clear"),
-        (re.compile(r"\bGprofessional\b", re.I), "Professional"),
-
-        # Trading copy: Bitácora -> trading journal (cuando queda en inglés)
-        (re.compile(r"\bBitacora\b", re.I), "Trading journal"),
-    ]
-    for rx, rep in fixes:
-        t = rx.sub(rep, t)
-
-    # 8) Normalizar espacios por línea (sin destruir saltos)
-    t = "\n".join([re.sub(r"[ \t]+", " ", ln).rstrip() for ln in t.split("\n")])
-    t = re.sub(r"\n{3,}", "\n\n", t).strip()
-
-    return t
-
+    return out
 def probably_english(text: str) -> bool:
     if _ES_MARKERS.search(text):
         return False

@@ -436,8 +436,8 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
         text2 = re.sub(r'^\s*Importante\s*:', 'Important:', text2, flags=re.I|re.M)
 
     url = f"https://{DEEPL_API_HOST}/v2/translate"
+    headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
     data = {
-        "auth_key": DEEPL_API_KEY,
         "text": text2,
         "source_lang": SOURCE_LANG,
         "target_lang": TARGET_LANG,
@@ -447,7 +447,7 @@ async def deepl_translate(text: str, *, session: aiohttp.ClientSession) -> str:
     if gid:
         data["glossary_id"] = gid
 
-    async with session.post(url, data=data) as r:
+    async with session.post(url, headers=headers, data=data) as r:
         b = await r.text()
         if r.status != 200:
             log.warning("DeepL HTTP %s: %s", r.status, b)

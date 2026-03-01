@@ -370,6 +370,58 @@ bearish\tbearish
 """
 
 # ================== TRADUCCIÓN (DEEPL + GLOSARIO) ==================
+# ================== TRADUCCIÓN DE MARKUP (HTML/XML) PARA CONSERVAR LINKS BONITOS ==================
+_TAG_RE = re.compile(r"<[^>]+>")
+
+def _strip_tags(s: str) -> str:
+    return _TAG_RE.sub("", s or "")
+
+async def deepl_translate_markup(markup_text: str, *, session: aiohttp.ClientSession) -> str:
+    """
+    Traduce texto en formato HTML/XML conservando tags (por ejemplo <a href="...">link</a>).
+    DeepL conserva href y solo traduce el texto visible, así tus enlaces se mantienen bonitos.
+    """
+    if not (markup_text or "").strip():
+        return markup_text
+    if not TRANSLATE or not DEEPL_API_KEY:
+        return markup_text
+
+    plain = _strip_tags(markup_text).strip()
+    if plain and (not FORCE_TRANSLATE) and probably_english(plain):
+        return markup_text
+
+    gid = _glossary_id_mem or GLOSSARY_ID or ""
+    if not gid and (GLOSSARY_TSV or DEFAULT_GLOSSARY_TSV):
+        try:
+            gid = await deepl_create_glossary_if_needed() or ""
+        except Exception:
+            gid = ""
+
+    url = f"https://{DEEPL_API_HOST}/v2/translate"
+    headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
+    data = {
+        "text": markup_text,
+        "source_lang": SOURCE_LANG,
+        "target_lang": TARGET_LANG,
+        "tag_handling": "xml",
+        "split_sentences": "nonewlines",
+        "preserve_formatting": "1",
+        "ignore_tags": "code,pre",
+    }
+    if TARGET_LANG in DEEPL_FORMALITY_LANGS:
+        data["formality"] = FORMALITY
+    if gid:
+        data["glossary_id"] = gid
+
+    async with session.post(url, headers=headers, data=data) as r:
+        b = await r.text()
+        if r.status != 200:
+            log.warning("DeepL(markup) HTTP %s: %s", r.status, b)
+            return markup_text
+        js = await r.json()
+        return js["translations"][0]["text"]
+# ================== FIN TRADUCCIÓN DE MARKUP ==================
+
 DEEPL_FORMALITY_LANGS = {"DE", "FR", "IT", "ES", "NL", "PL", "PT-PT", "PT-BR", "RU", "JA"}
 _glossary_id_mem: Optional[str] = None  # cache en memoria para esta ejecución
 
@@ -600,20 +652,16 @@ async def replicate_audio_with_translation(
     return
 # ================== TRADUCCIÓN VISIBLE ==================
 async def translate_visible_html(text: str, entities: List[MessageEntity]) -> Tuple[str, List[MessageEntity]]:
-    frags = entities_to_html(text, entities or [])
+    """
+    Traduce preservando formato y links bonitos:
+    - Entities -> HTML (<a href="...">texto</a>, <b>, etc.)
+    - DeepL traduce el HTML completo (tag_handling=xml) preservando href.
+    """
+    html_in = build_html(entities_to_html(text or "", entities or []))
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        new_frags: List[Tuple[str, Dict[str, Any]]] = []
-        for frag, meta in frags:
-            if meta.get("tag") in {None, "b", "i", "u", "s", "code", "pre", "a"}:
-                new_text = await deepl_translate(frag, session=session)
-                new_frags.append((new_text, meta))
-            else:
-                new_frags.append((frag, meta))
-    html_text = build_html(new_frags)
-    return html_text, []
-
-
+        html_out = await deepl_translate_markup(html_in, session=session)
+    return html_out, []
 def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
     return build_html(entities_to_html(text, entities or []))
 
@@ -844,6 +892,93 @@ def resolve_reply_to_id(src_msg: Message, dst_chat: int) -> Optional[int]:
         return None
 
 
+
+# ================== SPLIT SEGURO PARA MENSAJES HTML (evita romper <a href=...>) ==================
+def split_html_safe(html_text: str, max_len: int) -> List[str]:
+    """
+    Divide HTML en partes <= max_len sin partir dentro de tags.
+    Cortamos preferiblemente en saltos de línea fuera de etiquetas.
+    """
+    s = html_text or ""
+    if len(s) <= max_len:
+        return [s]
+
+    parts: List[str] = []
+    buf: List[str] = []
+    inside_tag = False
+    last_safe_break = -1
+    current_len = 0
+
+    for ch in s:
+        buf.append(ch)
+        current_len += 1
+
+        if ch == "<":
+            inside_tag = True
+        elif ch == ">" and inside_tag:
+            inside_tag = False
+
+        if (ch == "\n") and (not inside_tag):
+            last_safe_break = len(buf)
+
+        if current_len >= max_len:
+            if last_safe_break > 0:
+                part = "".join(buf[:last_safe_break]).rstrip()
+                parts.append(part)
+                buf = buf[last_safe_break:]
+                current_len = len(buf)
+                last_safe_break = -1
+            else:
+                part = "".join(buf).rstrip()
+                parts.append(part[:max_len])
+                rest = part[max_len:]
+                buf = [rest] if rest else []
+                current_len = len(rest)
+                last_safe_break = -1
+
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return [p for p in parts if p]
+
+async def send_html_message_in_chunks(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int | str,
+    thread_id: Optional[int],
+    html_text: str,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    reply_to_message_id: Optional[int],
+    max_len: int = 3900,
+) -> Message:
+    """
+    Envía HTML en 1 o varias partes. Solo el primer mensaje lleva botones y reply_to.
+    Retorna el primer Message (para mapear replies/edits).
+    """
+    parts = split_html_safe(html_text, max_len=max_len)
+    first_msg: Optional[Message] = None
+
+    for i, part in enumerate(parts):
+        kb = reply_markup if i == 0 else None
+        rply = reply_to_message_id if i == 0 else None
+        sent = await call_with_retry(
+            "send_message_chunk",
+            lambda p=part, k=kb, r=rply: context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=p,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=k,
+                reply_to_message_id=r,
+            ),
+        )
+        if first_msg is None:
+            first_msg = sent
+
+    return first_msg  # type: ignore
+# ================== FIN SPLIT SEGURO ==================
+
 # ================== REPLICACIÓN ==================
 async def send_text(
     context: ContextTypes.DEFAULT_TYPE,
@@ -865,17 +1000,15 @@ async def send_text(
     html_text = pref + html_text
     kb = await translate_buttons(msg.reply_markup, do_translate=do_translate and TRANSLATE)
 
-    sent = await call_with_retry(
-        "send_message",
-        lambda: context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-            text=html_text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=kb,
-            reply_to_message_id=reply_to_message_id,
-        ),
+    # Telegram texto ~4096. Usamos 3900 por seguridad y para no romper links/HTML.
+    sent = await send_html_message_in_chunks(
+        context,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        html_text=html_text,
+        reply_markup=kb,
+        reply_to_message_id=reply_to_message_id,
+        max_len=3900,
     )
     return sent
 

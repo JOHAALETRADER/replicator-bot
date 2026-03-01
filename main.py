@@ -280,8 +280,24 @@ def escape(t: str) -> str:
 
 
 def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str, Dict[str, Any]]]:
+    """
+    Convierte entities de Telegram a fragments + metadata para reconstruir HTML.
+    Soporta PTB donde e.type puede ser string ("bold") o enum (MessageEntityType.BOLD).
+    """
     if not entities:
         return [(text, {})]
+
+    def _etype(e: MessageEntity) -> str:
+        t = getattr(e, "type", "")
+        # PTB: enum con .value; otros: string
+        if hasattr(t, "value"):
+            t = t.value
+        t = str(t).strip()
+        # Por si viene "MessageEntityType.BOLD"
+        if t.startswith("MessageEntityType."):
+            t = t.split(".", 1)[1]
+        return t.lower()
+
     entities = sorted(entities, key=lambda e: e.offset)
     res: List[Tuple[str, Dict[str, Any]]] = []
     idx = 0
@@ -290,23 +306,31 @@ def entities_to_html(text: str, entities: List[MessageEntity]) -> List[Tuple[str
             res.append((text[idx:e.offset], {}))
         frag = text[e.offset:e.offset + e.length]
         meta: Dict[str, Any] = {}
-        if e.type in ("bold",):
+
+        t = _etype(e)
+        if t == "bold":
             meta["tag"] = "b"
-        elif e.type in ("italic",):
+        elif t == "italic":
             meta["tag"] = "i"
-        elif e.type in ("underline",):
+        elif t == "underline":
             meta["tag"] = "u"
-        elif e.type in ("strikethrough",):
+        elif t == "strikethrough":
             meta["tag"] = "s"
-        elif e.type in ("code",):
+        elif t == "code":
             meta["tag"] = "code"
-        elif e.type == "text_link" and e.url:
+        elif t in ("text_link", "textlink") and getattr(e, "url", None):
             meta["tag"] = "a"
             meta["href"] = e.url
+        elif t == "url":
+            # URL visible (no "bonito"), lo volvemos link también
+            meta["tag"] = "a"
+            meta["href"] = frag
         else:
             meta = {}
+
         res.append((frag, meta))
         idx = e.offset + e.length
+
     if idx < len(text):
         res.append((text[idx:], {}))
     return res

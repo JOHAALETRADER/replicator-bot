@@ -5,6 +5,7 @@ import re
 import asyncio
 import io
 import sqlite3
+import time
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Callable, Awaitable
 
@@ -65,9 +66,124 @@ GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()  # si no está, usamos el D
 ERROR_ALERT = os.getenv("ERROR_ALERT", "true").lower() == "true"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5958154558") or "0")
 
+# Supervisión y métricas
+AUTO_RECOVERY = os.getenv("AUTO_RECOVERY", "true").lower() == "true"
+HEALTHCHECK_INTERVAL_SEC = float(os.getenv("HEALTHCHECK_INTERVAL_SEC", "300") or "300")
+HEALTHCHECK_TIMEOUT_SEC = float(os.getenv("HEALTHCHECK_TIMEOUT_SEC", "30") or "30")
+HEALTHCHECK_FAILURE_LIMIT = max(1, int(os.getenv("HEALTHCHECK_FAILURE_LIMIT", "3") or "3"))
+METRICS_LOG_INTERVAL_SEC = float(os.getenv("METRICS_LOG_INTERVAL_SEC", "1800") or "1800")
+
 # Logging
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO)
+
+
+class SensitiveDataFilter(logging.Filter):
+    """Oculta credenciales aunque una librería incluya la URL completa en un log."""
+
+    _bot_token_pattern = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{25,}\b")
+    _auth_pattern = re.compile(r"(?i)(DeepL-Auth-Key|Bearer)\s+[^\s,;]+")
+
+    def __init__(self, secrets: List[str]):
+        super().__init__()
+        self.secrets = tuple(secret for secret in secrets if secret)
+
+    def redact(self, value: Any) -> str:
+        message = str(value)
+        for secret in self.secrets:
+            message = message.replace(secret, "<CREDENCIAL_OCULTA>")
+        message = self._bot_token_pattern.sub("<BOT_TOKEN_OCULTO>", message)
+        return self._auth_pattern.sub(r"\1 <CREDENCIAL_OCULTA>", message)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = self.redact(record.getMessage())
+            record.args = ()
+        except Exception:
+            # El filtro nunca debe impedir que el bot continúe funcionando.
+            pass
+        return True
+
+
+_secret_filter = SensitiveDataFilter([BOT_TOKEN, DEEPL_API_KEY, OPENAI_API_KEY])
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_secret_filter)
+
+# Evita las líneas HTTP que antes mostraban la URL de Telegram con el token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.request").setLevel(logging.WARNING)
+
 log = logging.getLogger("replicator")
+
+STARTED_AT = time.monotonic()
+METRICS: Dict[str, int] = {
+    "recibidos": 0,
+    "entregados": 0,
+    "albums_en_cola": 0,
+    "editados": 0,
+    "ignorados": 0,
+    "fallidos": 0,
+    "reintentos": 0,
+    "health_fallos": 0,
+}
+
+
+def metrics_inc(name: str, amount: int = 1) -> None:
+    METRICS[name] = METRICS.get(name, 0) + amount
+
+
+def message_kind(msg: Message) -> str:
+    if getattr(msg, "media_group_id", None):
+        return "album"
+    if msg.text:
+        return "texto"
+    if getattr(msg, "photo", None):
+        return "foto"
+    if getattr(msg, "video", None):
+        return "video"
+    if getattr(msg, "voice", None):
+        return "nota_voz"
+    if getattr(msg, "audio", None):
+        return "audio"
+    if getattr(msg, "document", None):
+        return "documento"
+    if getattr(msg, "animation", None):
+        return "animacion"
+    if getattr(msg, "sticker", None):
+        return "sticker"
+    return "otro"
+
+
+def chat_label(chat: Chat) -> str:
+    username = getattr(chat, "username", None)
+    title = (getattr(chat, "title", None) or "").replace("\n", " ").strip()
+    if username:
+        return f"@{username}({chat.id})"
+    if title:
+        return f"{title}({chat.id})"
+    return str(chat.id)
+
+
+def log_delivery(
+    src_msg: Message,
+    dest_chat_id: int | str,
+    dest_thread_id: Optional[int],
+    *,
+    route_kind: str,
+    do_translate: bool,
+) -> None:
+    metrics_inc("entregados")
+    log.info(
+        "ENTREGA OK | ruta=%s | origen=%s | msg=%s | destino=%s | tema=%s | contenido=%s | traducir=%s | total=%s",
+        route_kind,
+        src_msg.chat.id,
+        src_msg.message_id,
+        dest_chat_id,
+        dest_thread_id if dest_thread_id is not None else "-",
+        message_kind(src_msg),
+        do_translate and TRANSLATE,
+        METRICS["entregados"],
+    )
 
 # ================== CANAL → CANAL ==================
 CHANNEL_MAP: Dict[Any, Any] = {
@@ -133,6 +249,8 @@ TOPIC_ROUTES: Dict[Tuple[int, int], Tuple[int, int, Optional[int]]] = {
     (G3, 3): (G3, 4096, None),
     (G3, 2): (G3, 4098, None),  # ES → EN dentro del mismo grupo (si el origen es directo)
 }
+
+SOURCE_CHAT_IDS = {chat_id for chat_id, _thread_id in TOPIC_ROUTES}
 
 # ================== FAN-OUT OPCIONAL ==================
 FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
@@ -853,7 +971,8 @@ def route_no_translate(src_chat: int, src_thread: Optional[int], dst_chat: int, 
 async def alert_error(context: ContextTypes.DEFAULT_TYPE, text: str):
     if ERROR_ALERT and ADMIN_ID:
         try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ {text[:3800]}")
+            safe_text = _secret_filter.redact(text)
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ {safe_text[:3800]}")
         except Exception:
             pass
 
@@ -872,11 +991,13 @@ async def call_with_retry(
             return await fn()
         except RetryAfter as e:
             last_exc = e
+            metrics_inc("reintentos")
             wait_s = float(getattr(e, "retry_after", 1.0))
             log.warning("[%s] RetryAfter %ss (intento %s/%s)", label, wait_s, i, tries)
             await asyncio.sleep(wait_s + 0.2)
         except (TimedOut, NetworkError) as e:
             last_exc = e
+            metrics_inc("reintentos")
             wait = base_delay * (2 ** (i - 1))
             log.warning("[%s] Timeout/NetworkError (intento %s/%s). Esperando %.1fs. Err=%s", label, i, tries, wait, e)
             await asyncio.sleep(wait)
@@ -888,6 +1009,7 @@ async def call_with_retry(
             raise
         except Exception as e:
             last_exc = e
+            metrics_inc("reintentos")
             wait = base_delay * (2 ** (i - 1))
             log.warning("[%s] Error inesperado (intento %s/%s). Esperando %.1fs. Err=%s", label, i, tries, wait, e)
             await asyncio.sleep(wait)
@@ -1186,7 +1308,16 @@ async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE, key: Tuple[int,
                 if i < len(sent_msgs):
                     db_save_map(sm.chat.id, sm.message_id, int(dst_chat), sent_msgs[i].message_id)
 
+        log_delivery(
+            msgs[0],
+            dst_chat,
+            dst_thread,
+            route_kind="album",
+            do_translate=do_translate,
+        )
+
     except Exception as e:
+        metrics_inc("fallidos")
         log.exception("Error enviando media group %s: %s", key, e)
         await alert_error(context, f"media_group error: {e}")
 
@@ -1422,12 +1553,35 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.channel_post:
             return
         msg = update.channel_post
+        metrics_inc("recibidos")
+        log.info(
+            "RECIBIDO | tipo=canal | origen=%s | msg=%s | contenido=%s",
+            chat_label(msg.chat),
+            msg.message_id,
+            message_kind(msg),
+        )
         dst = map_channel(msg.chat)
         if not dst:
+            metrics_inc("ignorados")
+            log.warning(
+                "SIN RUTA | tipo=canal | origen=%s | msg=%s",
+                chat_label(msg.chat),
+                msg.message_id,
+            )
             return
-        log.info("Channel %s (id=%s) → %s | msg %s", msg.chat.username, msg.chat.id, dst, msg.message_id)
         await replicate_message(context, msg, dst, None, do_translate=True)
+        if getattr(msg, "media_group_id", None):
+            metrics_inc("albums_en_cola")
+            log.info(
+                "ALBUM EN COLA | ruta=canal | origen=%s | msg=%s | destino=%s",
+                msg.chat.id,
+                msg.message_id,
+                dst,
+            )
+        else:
+            log_delivery(msg, dst, None, route_kind="canal", do_translate=True)
     except Exception as e:
+        metrics_inc("fallidos")
         log.exception("Error on_channel_post")
         await alert_error(context, f"on_channel_post: {e}")
 
@@ -1441,12 +1595,24 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
             return
 
+        if chat.id in SOURCE_CHAT_IDS:
+            metrics_inc("recibidos")
+            log.info(
+                "RECIBIDO | tipo=grupo | origen=%s | tema=%s | msg=%s | contenido=%s",
+                chat_label(chat),
+                msg.message_thread_id if msg.message_thread_id is not None else 1,
+                msg.message_id,
+                message_kind(msg),
+            )
+
         # ✅ Dedup
         if seen_recent(chat.id, msg.message_id):
+            metrics_inc("ignorados")
             return
 
         # ✅ Anti-loop: si viene desde un tema destino, no replicar
         if is_destination_topic(chat.id, msg.message_thread_id):
+            metrics_inc("ignorados")
             return
 
         thread_id = msg.message_thread_id
@@ -1454,6 +1620,14 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         route = map_topic(chat.id, thread_id, sender_id)
         if not route:
+            if chat.id in SOURCE_CHAT_IDS:
+                metrics_inc("ignorados")
+                log.info(
+                    "SIN RUTA | tipo=grupo | origen=%s | tema=%s | msg=%s",
+                    chat_label(chat),
+                    thread_id if thread_id is not None else 1,
+                    msg.message_id,
+                )
             return
         dst_chat, dst_thread = route
 
@@ -1471,7 +1645,25 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             await replicate_message(context, msg, dst_chat, dst_thread, do_translate=do_translate_main)
+            if getattr(msg, "media_group_id", None):
+                metrics_inc("albums_en_cola")
+                log.info(
+                    "ALBUM EN COLA | ruta=principal | origen=%s | msg=%s | destino=%s | tema=%s",
+                    chat.id,
+                    msg.message_id,
+                    dst_chat,
+                    dst_thread,
+                )
+            else:
+                log_delivery(
+                    msg,
+                    dst_chat,
+                    dst_thread,
+                    route_kind="principal",
+                    do_translate=do_translate_main,
+                )
         except Exception as e:
+            metrics_inc("fallidos")
             log.warning("Fallo ruta principal %s#%s -> %s#%s: %s", chat.id, thread_id, dst_chat, dst_thread, e)
             await alert_error(context, f"Ruta principal fallo: {chat.id}#{thread_id} -> {dst_chat}#{dst_thread}\n{e}")
 
@@ -1490,11 +1682,30 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             try:
                 await replicate_message(context, msg, extra_chat, extra_thread, do_translate=do_translate_extra)
+                if getattr(msg, "media_group_id", None):
+                    metrics_inc("albums_en_cola")
+                    log.info(
+                        "ALBUM EN COLA | ruta=fanout | origen=%s | msg=%s | destino=%s | tema=%s",
+                        chat.id,
+                        msg.message_id,
+                        extra_chat,
+                        extra_thread,
+                    )
+                else:
+                    log_delivery(
+                        msg,
+                        extra_chat,
+                        extra_thread,
+                        route_kind="fanout",
+                        do_translate=do_translate_extra,
+                    )
             except Exception as e:
+                metrics_inc("fallidos")
                 log.warning("Fallo fanout %s#%s -> %s#%s: %s", chat.id, tid_norm, extra_chat, extra_thread, e)
                 await alert_error(context, f"Fanout fallo: {chat.id}#{tid_norm} -> {extra_chat}#{extra_thread}\n{e}")
 
     except Exception as e:
+        metrics_inc("fallidos")
         log.exception("Error on_group_post")
         await alert_error(context, f"on_group_post: {e}")
 
@@ -1539,10 +1750,121 @@ async def on_group_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await replicate_edit(context, msg, dst_chat, dst_thread, do_translate=do_translate_main)
+        metrics_inc("editados")
+        log.info(
+            "EDICION OK | origen=%s | tema=%s | msg=%s | destino=%s | tema_destino=%s | total=%s",
+            chat.id,
+            thread_id if thread_id is not None else 1,
+            msg.message_id,
+            dst_chat,
+            dst_thread,
+            METRICS["editados"],
+        )
 
     except Exception as e:
+        metrics_inc("fallidos")
         log.exception("Error on_group_edit")
         await alert_error(context, f"on_group_edit: {e}")
+
+
+# ================== SALUD / AUTORRECUPERACIÓN ==================
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def metrics_summary() -> str:
+    uptime_hours = (time.monotonic() - STARTED_AT) / 3600
+    return (
+        f"uptime={uptime_hours:.1f}h | recibidos={METRICS['recibidos']} | "
+        f"entregados={METRICS['entregados']} | editados={METRICS['editados']} | "
+        f"ignorados={METRICS['ignorados']} | fallidos={METRICS['fallidos']} | "
+        f"reintentos={METRICS['reintentos']} | health_fallos={METRICS['health_fallos']}"
+    )
+
+
+async def metrics_monitor() -> None:
+    if METRICS_LOG_INTERVAL_SEC <= 0:
+        return
+    while True:
+        await asyncio.sleep(METRICS_LOG_INTERVAL_SEC)
+        log.info("METRICAS | %s", metrics_summary())
+
+
+async def health_monitor(application: Application) -> None:
+    """
+    Verifica periódicamente que Telegram responda. Tras varios fallos consecutivos,
+    termina con error para que Railway reinicie el servicio automáticamente.
+    """
+    if not AUTO_RECOVERY or HEALTHCHECK_INTERVAL_SEC <= 0:
+        log.info("AUTORRECUPERACION desactivada")
+        return
+
+    consecutive_failures = 0
+    checks = 0
+    while True:
+        await asyncio.sleep(HEALTHCHECK_INTERVAL_SEC)
+        checks += 1
+        try:
+            if application.updater is None or not application.updater.running:
+                raise RuntimeError("el polling de Telegram no esta activo")
+            await asyncio.wait_for(application.bot.get_me(), timeout=HEALTHCHECK_TIMEOUT_SEC)
+            consecutive_failures = 0
+            # Una confirmación horaria aproximada con los valores por defecto.
+            checks_per_hour = max(1, int(3600 / HEALTHCHECK_INTERVAL_SEC))
+            if checks % checks_per_hour == 0:
+                log.info("SALUD OK | Telegram responde | %s", metrics_summary())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            consecutive_failures += 1
+            metrics_inc("health_fallos")
+            log.warning(
+                "SALUD FALLO | intento=%s/%s | error=%s",
+                consecutive_failures,
+                HEALTHCHECK_FAILURE_LIMIT,
+                e,
+            )
+            if consecutive_failures >= HEALTHCHECK_FAILURE_LIMIT:
+                log.critical(
+                    "AUTORRECUPERACION | Telegram no respondió tras %s intentos. "
+                    "Se reinicia el proceso para que Railway lo levante limpio.",
+                    HEALTHCHECK_FAILURE_LIMIT,
+                )
+                os._exit(1)
+
+
+async def post_init(application: Application) -> None:
+    try:
+        bot = await asyncio.wait_for(application.bot.get_me(), timeout=HEALTHCHECK_TIMEOUT_SEC)
+        log.info("BOT LISTO | @%s | id=%s", bot.username or "sin_username", bot.id)
+    except Exception as e:
+        log.warning("BOT ARRANCO, pero la verificacion inicial fallo: %s", e)
+
+    for coroutine in (health_monitor(application), metrics_monitor()):
+        task = asyncio.create_task(coroutine)
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def post_shutdown(application: Application) -> None:
+    del application
+    tasks = list(_BACKGROUND_TASKS)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _BACKGROUND_TASKS.clear()
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    metrics_inc("fallidos")
+    error = context.error
+    log.error(
+        "ERROR GLOBAL | update=%s | error=%s",
+        getattr(update, "update_id", "-"),
+        error,
+        exc_info=(type(error), error, error.__traceback__) if error else None,
+    )
+    await alert_error(context, f"Error global: {error}")
 
 
 # ================== MAIN ==================
@@ -1562,28 +1884,51 @@ def main():
         pool_timeout=20.0,
     )
 
-    app = Application.builder().token(BOT_TOKEN).request(request).build()
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_post))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.EDITED_MESSAGE, on_group_edit))
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    app.add_error_handler(global_error_handler)
+
+    app.add_handler(
+        MessageHandler(filters.UpdateType.CHANNEL_POST & filters.ChatType.CHANNEL, on_channel_post)
+    )
+    app.add_handler(
+        MessageHandler(filters.UpdateType.MESSAGE & filters.ChatType.GROUPS, on_group_post)
+    )
+    app.add_handler(
+        MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.ChatType.GROUPS, on_group_edit)
+    )
 
     # Opcional
-    app.add_handler(CommandHandler("edit", cmd_edit))
-    app.add_handler(CommandHandler("editmedia", cmd_editmedia))
+    app.add_handler(CommandHandler("edit", cmd_edit), group=-1)
+    app.add_handler(CommandHandler("editmedia", cmd_editmedia), group=-1)
 
     log.info(
-        "Replicator iniciado. Translate=%s, Buttons=%s | ENV_SRC=%s ENV_DST=%s | DB=%s | DedupTTL=%ss",
+        "REPLICATOR INICIADO | version=2026.09.15 | translate=%s | buttons=%s | "
+        "env_src=%s | env_dst=%s | rutas_tema=%s | fanouts=%s | db=%s | "
+        "dedup_ttl=%ss | autorecovery=%s | health_cada=%ss | limite_fallos=%s",
         TRANSLATE,
         TRANSLATE_BUTTONS,
         ENV_SRC,
         ENV_DST,
+        len(TOPIC_ROUTES),
+        sum(len(routes) for routes in FANOUT_ROUTES.values()),
         str(DB_PATH),
         str(DEDUP_TTL_SECONDS),
+        AUTO_RECOVERY,
+        HEALTHCHECK_INTERVAL_SEC,
+        HEALTHCHECK_FAILURE_LIMIT,
     )
 
     app.run_polling(
         allowed_updates=["channel_post", "message", "edited_message"],
         poll_interval=1.2,
+        bootstrap_retries=-1,
         stop_signals=None,
         drop_pending_updates=True
 

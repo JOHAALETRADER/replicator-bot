@@ -72,7 +72,7 @@ GLOSSARY_TSV = os.getenv("GLOSSARY_TSV", "").strip()  # si no está, usamos el D
 
 # Alertas
 ERROR_ALERT = os.getenv("ERROR_ALERT", "true").lower() == "true"
-ADMIN_ID = int(os.getenv("ADMIN_ID", "5958154558") or "0")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5958164558") or "0")
 
 # Supervisión y métricas
 AUTO_RECOVERY = os.getenv("AUTO_RECOVERY", "true").lower() == "true"
@@ -944,7 +944,31 @@ def withdrawal_pair_claim(user_msg: int, assistant_msg: int, dst_chat: int) -> b
                 """,
                 (G1, int(user_msg), int(assistant_msg), int(dst_chat)),
             )
-        return cur.rowcount == 1
+            if cur.rowcount == 1:
+                return True
+
+            # Reintento seguro: solo se recuperan fallos ocurridos antes de que
+            # existiera cualquier publicación en el destino. Si ya hay un ID
+            # público, se conserva el bloqueo para evitar duplicados.
+            row = _DB_CONN.execute(
+                """
+                SELECT status, user_dst_msg, assistant_dst_msg
+                  FROM withdrawal_public_pairs
+                 WHERE src_chat=? AND user_msg=? AND dst_chat=?
+                """,
+                (G1, int(user_msg), int(dst_chat)),
+            ).fetchone()
+            if row and row[0] == "uncertain" and row[1] is None and row[2] is None:
+                _DB_CONN.execute(
+                    """
+                    UPDATE withdrawal_public_pairs
+                       SET assistant_msg=?, status='sending'
+                     WHERE src_chat=? AND user_msg=? AND dst_chat=?
+                    """,
+                    (int(assistant_msg), G1, int(user_msg), int(dst_chat)),
+                )
+                return True
+        return False
     except Exception as e:
         log.warning("withdrawal_pair_claim failed: %s", e)
         return False

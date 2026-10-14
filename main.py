@@ -2467,23 +2467,47 @@ async def publish_historical_withdrawal_pair(
 
     temporary_messages: List[int] = []
     try:
-        forwarded_user = await call_with_retry(
-            "retiro_historico_recuperar_usuario",
-            lambda: application.bot.forward_message(
+        # El origen puede tener protección de contenido: Telegram permite la
+        # copia usada por esta ruta, pero bloquea el forward directo. Se crea
+        # primero una copia privada no protegida y se reenvía esa copia solo
+        # para obtener un Message completo (texto/caption/file_id) y traducirlo.
+        copied_user = await call_with_retry(
+            "retiro_historico_copiar_usuario",
+            lambda: application.bot.copy_message(
                 chat_id=ADMIN_ID,
                 from_chat_id=G1,
                 message_id=user_msg,
+            ),
+        )
+        temporary_messages.append(int(copied_user.message_id))
+
+        forwarded_user = await call_with_retry(
+            "retiro_historico_leer_usuario",
+            lambda: application.bot.forward_message(
+                chat_id=ADMIN_ID,
+                from_chat_id=ADMIN_ID,
+                message_id=int(copied_user.message_id),
                 disable_notification=True,
             ),
         )
         temporary_messages.append(int(forwarded_user.message_id))
 
-        forwarded_assistant = await call_with_retry(
-            "retiro_historico_recuperar_asistente",
-            lambda: application.bot.forward_message(
+        copied_assistant = await call_with_retry(
+            "retiro_historico_copiar_asistente",
+            lambda: application.bot.copy_message(
                 chat_id=ADMIN_ID,
                 from_chat_id=G1,
                 message_id=assistant_msg,
+            ),
+        )
+        temporary_messages.append(int(copied_assistant.message_id))
+
+        forwarded_assistant = await call_with_retry(
+            "retiro_historico_leer_asistente",
+            lambda: application.bot.forward_message(
+                chat_id=ADMIN_ID,
+                from_chat_id=ADMIN_ID,
+                message_id=int(copied_assistant.message_id),
                 disable_notification=True,
             ),
         )

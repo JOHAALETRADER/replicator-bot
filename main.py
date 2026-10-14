@@ -1713,16 +1713,49 @@ async def publish_withdrawal_item(
             reply_to_message_id=reply_to_message_id,
         )
     else:
-        # Se copia una sola captura, incluso si originalmente pertenecía a un álbum.
-        # Así la respuesta puede enlazarse inmediatamente y no se publica el resto.
-        sent = await copy_with_caption(
-            context,
-            destination,
-            None,
-            src_msg,
-            do_translate=do_translate,
-            reply_to_message_id=reply_to_message_id,
-        )
+        # Retiros VIP tiene protección de contenido: copyMessage/forwardMessage
+        # puede ser rechazado aunque el bot sí haya recibido el archivo. Para
+        # esta ruta concreta se vuelve a enviar el file_id recibido en tiempo
+        # real, sin alterar el comportamiento de las demás réplicas.
+        name = sender_display_name(src_msg)
+        cap_text = src_msg.caption or ""
+        cap_entities = src_msg.caption_entities or []
+        if cap_text.strip():
+            if do_translate and TRANSLATE:
+                cap_html, _ = await translate_visible_html(cap_text, cap_entities)
+            else:
+                cap_html = build_html_no_translate(cap_text, cap_entities)
+        else:
+            cap_html = ""
+        cap_html = cap_with_prefix(prefix_block(name), cap_html, max_len=1024)
+        kb = await translate_buttons(src_msg.reply_markup, do_translate=do_translate and TRANSLATE)
+
+        if src_msg.photo:
+            sent = await call_with_retry(
+                "retiro_send_photo",
+                lambda: context.bot.send_photo(
+                    chat_id=destination,
+                    photo=src_msg.photo[-1].file_id,
+                    caption=cap_html,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                    reply_to_message_id=reply_to_message_id,
+                ),
+            )
+        elif src_msg.document and (src_msg.document.mime_type or "").lower().startswith("image/"):
+            sent = await call_with_retry(
+                "retiro_send_document",
+                lambda: context.bot.send_document(
+                    chat_id=destination,
+                    document=src_msg.document.file_id,
+                    caption=cap_html,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                    reply_to_message_id=reply_to_message_id,
+                ),
+            )
+        else:
+            raise ValueError("El retiro confirmado no contiene una imagen publicable.")
 
     if not sent:
         return None

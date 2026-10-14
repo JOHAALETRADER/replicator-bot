@@ -267,6 +267,25 @@ FANOUT_ROUTES: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
     (G1, 17373): [(G3, 2), (G3, 4098)],
 }
 
+# ================== RETIROS VIP → CANAL INFORMATIVO ==================
+# Esta salida es adicional e independiente: no sustituye ni modifica las
+# réplicas principal y fan-out que ya existen para el tema 17373.
+WITHDRAWAL_PUBLIC_DESTINATION = -1001822808132  # @JohaaleTrader_es
+WITHDRAWAL_ASSISTANT_ID = int(os.getenv("WITHDRAWAL_ASSISTANT_ID", "8611286359") or "0")
+WITHDRAWAL_BACKFILL_ENABLED = os.getenv("WITHDRAWAL_BACKFILL_ENABLED", "false").lower() == "true"
+
+# Pares verificados visualmente en Retiros VIP: mensaje del usuario y primera
+# respuesta del Asistente JT. Se publican una sola vez cuando se habilita el backfill.
+WITHDRAWAL_BACKFILL_PAIRS: Tuple[Tuple[int, int], ...] = (
+    (23192, 23193),  # 11-oct-2026 · Alejandro
+    (23204, 23205),  # 13-oct-2026 · Jonas
+    (23212, 23213),  # 14-oct-2026 · Alejandro
+)
+
+WITHDRAWAL_PUBLIC_ROUTES: Dict[Tuple[int, int], List[int | str]] = {
+    (G1, 17373): [WITHDRAWAL_PUBLIC_DESTINATION],
+}
+
 # ================== OVERRIDE DE TRADUCCIÓN POR RUTA ==================
 NO_TRANSLATE_ROUTES: set[Tuple[int, int, int, int]] = {
     (G1, 129, G3, 3),  # ✅ fanout ES sin traducir
@@ -864,6 +883,19 @@ def db_init():
         )
     """)
     _DB_CONN.execute("CREATE INDEX IF NOT EXISTS idx_src ON msg_map (src_chat, src_msg)")
+    _DB_CONN.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_public_pairs (
+            src_chat       INTEGER NOT NULL,
+            user_msg       INTEGER NOT NULL,
+            assistant_msg  INTEGER NOT NULL,
+            dst_chat       INTEGER NOT NULL,
+            status         TEXT NOT NULL,
+            user_dst_msg   INTEGER,
+            assistant_dst_msg INTEGER,
+            PRIMARY KEY (src_chat, user_msg, dst_chat),
+            UNIQUE (src_chat, assistant_msg, dst_chat)
+        )
+    """)
     _DB_CONN.commit()
 
 
@@ -892,6 +924,59 @@ def db_get_dst_msg(src_chat: int, src_msg: int, dst_chat: int) -> Optional[int]:
         return int(row[0]) if row else None
     except Exception:
         return None
+
+
+def withdrawal_pair_claim(user_msg: int, assistant_msg: int, dst_chat: int) -> bool:
+    """Reserva un par una sola vez, incluso si dos actualizaciones llegan juntas."""
+    if not _DB_CONN:
+        db_init()
+    try:
+        with _DB_CONN:
+            cur = _DB_CONN.execute(
+                """
+                INSERT OR IGNORE INTO withdrawal_public_pairs
+                    (src_chat, user_msg, assistant_msg, dst_chat, status)
+                VALUES (?, ?, ?, ?, 'sending')
+                """,
+                (G1, int(user_msg), int(assistant_msg), int(dst_chat)),
+            )
+        return cur.rowcount == 1
+    except Exception as e:
+        log.warning("withdrawal_pair_claim failed: %s", e)
+        return False
+
+
+def withdrawal_pair_finish(
+    user_msg: int,
+    dst_chat: int,
+    status: str,
+    *,
+    user_dst_msg: Optional[int] = None,
+    assistant_dst_msg: Optional[int] = None,
+) -> None:
+    if not _DB_CONN:
+        db_init()
+    try:
+        with _DB_CONN:
+            _DB_CONN.execute(
+                """
+                UPDATE withdrawal_public_pairs
+                   SET status=?,
+                       user_dst_msg=COALESCE(?, user_dst_msg),
+                       assistant_dst_msg=COALESCE(?, assistant_dst_msg)
+                 WHERE src_chat=? AND user_msg=? AND dst_chat=?
+                """,
+                (
+                    status,
+                    user_dst_msg,
+                    assistant_dst_msg,
+                    G1,
+                    int(user_msg),
+                    int(dst_chat),
+                ),
+            )
+    except Exception as e:
+        log.warning("withdrawal_pair_finish failed: %s", e)
 
 
 # ================== PREFIJO "👤 Nombre:" ==================
@@ -1034,6 +1119,39 @@ def is_from_bot(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> bool:
     except Exception:
         pass
     return False
+
+
+def is_public_withdrawal_post(msg: Message) -> bool:
+    """Acepta contenido publicado por miembros; excluye bots y eventos internos."""
+    sender = getattr(msg, "from_user", None)
+    if sender is None or bool(getattr(sender, "is_bot", False)):
+        return False
+
+    return bool(
+        msg.text
+        or msg.caption
+        or getattr(msg, "photo", None)
+        or getattr(msg, "video", None)
+        or getattr(msg, "document", None)
+        or getattr(msg, "audio", None)
+        or getattr(msg, "voice", None)
+        or getattr(msg, "animation", None)
+        or getattr(msg, "sticker", None)
+        or getattr(msg, "poll", None)
+    )
+
+
+def public_withdrawal_reply_root(msg: Message) -> Optional[int]:
+    """Devuelve el mensaje humano respondido solo para la primera felicitación."""
+    sender = getattr(msg, "from_user", None)
+    if not sender or sender.id != WITHDRAWAL_ASSISTANT_ID:
+        return None
+
+    replied = getattr(msg, "reply_to_message", None)
+    replied_sender = getattr(replied, "from_user", None) if replied else None
+    if not replied or not replied_sender or bool(getattr(replied_sender, "is_bot", False)):
+        return None
+    return int(replied.message_id)
 
 
 def resolve_reply_to_id(src_msg: Message, dst_chat: int) -> Optional[int]:
@@ -2020,6 +2138,114 @@ async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.warning("Fallo fanout %s#%s -> %s#%s: %s", chat.id, tid_norm, extra_chat, extra_thread, e)
                 await alert_error(context, f"Fanout fallo: {chat.id}#{tid_norm} -> {extra_chat}#{extra_thread}\n{e}")
 
+        public_destinations = WITHDRAWAL_PUBLIC_ROUTES.get((chat.id, tid_norm), [])
+        public_reply_root = public_withdrawal_reply_root(msg)
+
+        if public_destinations and is_public_withdrawal_post(msg):
+            for public_destination in public_destinations:
+                log.info(
+                    "Retiro publico %s#%s → %s | translate=False | msg %s",
+                    chat.id,
+                    tid_norm,
+                    public_destination,
+                    msg.message_id,
+                )
+                try:
+                    await replicate_message(
+                        context,
+                        msg,
+                        public_destination,
+                        None,
+                        do_translate=False,
+                    )
+                    if getattr(msg, "media_group_id", None):
+                        metrics_inc("albums_en_cola")
+                        log.info(
+                            "ALBUM EN COLA | ruta=retiro_publico | origen=%s | msg=%s | destino=%s",
+                            chat.id,
+                            msg.message_id,
+                            public_destination,
+                        )
+                    else:
+                        log_delivery(
+                            msg,
+                            public_destination,
+                            None,
+                            route_kind="retiro_publico",
+                            do_translate=False,
+                        )
+                except Exception as e:
+                    metrics_inc("fallidos")
+                    log.warning(
+                        "Fallo retiro publico %s#%s -> %s: %s",
+                        chat.id,
+                        tid_norm,
+                        public_destination,
+                        e,
+                    )
+                    await alert_error(
+                        context,
+                        f"Retiro publico fallo: {chat.id}#{tid_norm} -> {public_destination}\n{e}",
+                    )
+
+        elif public_destinations and public_reply_root is not None:
+            for public_destination in public_destinations:
+                if not isinstance(public_destination, int):
+                    continue
+                if not withdrawal_pair_claim(public_reply_root, msg.message_id, public_destination):
+                    log.info(
+                        "RETIRO RESPUESTA OMITIDA | origen=%s | usuario_msg=%s | asistente_msg=%s | motivo=ya_procesada",
+                        chat.id,
+                        public_reply_root,
+                        msg.message_id,
+                    )
+                    continue
+                try:
+                    await replicate_message(
+                        context,
+                        msg,
+                        public_destination,
+                        None,
+                        do_translate=False,
+                    )
+                    mapped_reply = db_get_dst_msg(chat.id, msg.message_id, public_destination)
+                    withdrawal_pair_finish(
+                        public_reply_root,
+                        public_destination,
+                        "sent",
+                        user_dst_msg=db_get_dst_msg(chat.id, public_reply_root, public_destination),
+                        assistant_dst_msg=mapped_reply,
+                    )
+                    log_delivery(
+                        msg,
+                        public_destination,
+                        None,
+                        route_kind="retiro_respuesta",
+                        do_translate=False,
+                    )
+                except Exception as e:
+                    metrics_inc("fallidos")
+                    withdrawal_pair_finish(public_reply_root, public_destination, "uncertain")
+                    log.warning(
+                        "Fallo respuesta retiro %s#%s -> %s: %s",
+                        chat.id,
+                        tid_norm,
+                        public_destination,
+                        e,
+                    )
+                    await alert_error(
+                        context,
+                        f"Respuesta de retiro no confirmada: {chat.id}#{tid_norm} -> {public_destination}\n{e}",
+                    )
+
+        elif public_destinations:
+            log.info(
+                "RETIRO PUBLICO OMITIDO | origen=%s | tema=%s | msg=%s | motivo=bot_o_evento_interno",
+                chat.id,
+                tid_norm,
+                msg.message_id,
+            )
+
     except Exception as e:
         metrics_inc("fallidos")
         log.exception("Error on_group_post")
@@ -2081,6 +2307,83 @@ async def on_group_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         metrics_inc("fallidos")
         log.exception("Error on_group_edit")
         await alert_error(context, f"on_group_edit: {e}")
+
+
+# ================== RECUPERACIÓN ÚNICA DE RETIROS HISTÓRICOS ==================
+async def withdrawal_history_backfill(application: Application) -> None:
+    if not WITHDRAWAL_BACKFILL_ENABLED:
+        log.info("RETIROS HISTORICOS | recuperación desactivada")
+        return
+
+    # Deja que el polling termine de iniciar antes de publicar.
+    await asyncio.sleep(3)
+    for user_msg, assistant_msg in WITHDRAWAL_BACKFILL_PAIRS:
+        if not withdrawal_pair_claim(user_msg, assistant_msg, WITHDRAWAL_PUBLIC_DESTINATION):
+            log.info(
+                "RETIROS HISTORICOS | omitido usuario=%s asistente=%s | motivo=ya_procesado",
+                user_msg,
+                assistant_msg,
+            )
+            continue
+
+        user_dst_msg: Optional[int] = None
+        try:
+            copied_user = await call_with_retry(
+                "retiro_historico_usuario",
+                lambda source_id=user_msg: application.bot.copy_message(
+                    chat_id=WITHDRAWAL_PUBLIC_DESTINATION,
+                    from_chat_id=G1,
+                    message_id=source_id,
+                ),
+            )
+            user_dst_msg = int(copied_user.message_id)
+            db_save_map(G1, user_msg, WITHDRAWAL_PUBLIC_DESTINATION, user_dst_msg)
+
+            copied_assistant = await call_with_retry(
+                "retiro_historico_asistente",
+                lambda source_id=assistant_msg, reply_id=user_dst_msg: application.bot.copy_message(
+                    chat_id=WITHDRAWAL_PUBLIC_DESTINATION,
+                    from_chat_id=G1,
+                    message_id=source_id,
+                    reply_to_message_id=reply_id,
+                ),
+            )
+            assistant_dst_msg = int(copied_assistant.message_id)
+            db_save_map(G1, assistant_msg, WITHDRAWAL_PUBLIC_DESTINATION, assistant_dst_msg)
+            withdrawal_pair_finish(
+                user_msg,
+                WITHDRAWAL_PUBLIC_DESTINATION,
+                "sent",
+                user_dst_msg=user_dst_msg,
+                assistant_dst_msg=assistant_dst_msg,
+            )
+            metrics_inc("entregados", 2)
+            log.info(
+                "RETIROS HISTORICOS OK | usuario=%s | asistente=%s | destino=%s | total=%s",
+                user_msg,
+                assistant_msg,
+                WITHDRAWAL_PUBLIC_DESTINATION,
+                METRICS["entregados"],
+            )
+        except Exception as e:
+            metrics_inc("fallidos")
+            withdrawal_pair_finish(
+                user_msg,
+                WITHDRAWAL_PUBLIC_DESTINATION,
+                "uncertain",
+                user_dst_msg=user_dst_msg,
+            )
+            log.warning(
+                "RETIROS HISTORICOS NO CONFIRMADO | usuario=%s | asistente=%s | error=%s",
+                user_msg,
+                assistant_msg,
+                e,
+            )
+            await alert_error(
+                application,
+                f"Retiro histórico no confirmado: usuario={user_msg}, asistente={assistant_msg}. Revisar manualmente para evitar duplicados.\n{e}",
+            )
+        await asyncio.sleep(1)
 
 
 # ================== SALUD / AUTORRECUPERACIÓN ==================
@@ -2155,7 +2458,12 @@ async def post_init(application: Application) -> None:
     except Exception as e:
         log.warning("BOT ARRANCO, pero la verificacion inicial fallo: %s", e)
 
-    for coroutine in (health_monitor(application), metrics_monitor(), free_session_monitor(application)):
+    for coroutine in (
+        health_monitor(application),
+        metrics_monitor(),
+        free_session_monitor(application),
+        withdrawal_history_backfill(application),
+    ):
         task = asyncio.create_task(coroutine)
         _BACKGROUND_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_TASKS.discard)
@@ -2226,8 +2534,9 @@ def main():
     app.add_handler(CommandHandler("editmedia", cmd_editmedia), group=-1)
 
     log.info(
-        "REPLICATOR INICIADO | version=2026.10.04-POLLS-ORIGINAL-IMAGES | translate=%s | buttons=%s | "
-        "env_src=%s | env_dst=%s | rutas_tema=%s | fanouts=%s | db=%s | "
+        "REPLICATOR INICIADO | version=2026.10.14-RETIROS-PARES-BACKFILL | translate=%s | buttons=%s | "
+        "env_src=%s | env_dst=%s | rutas_tema=%s | fanouts=%s | retiros_publicos=%s | "
+        "backfill=%s | pares_historicos=%s | db=%s | "
         "dedup_ttl=%ss | autorecovery=%s | health_cada=%ss | limite_fallos=%s",
         TRANSLATE,
         TRANSLATE_BUTTONS,
@@ -2235,6 +2544,9 @@ def main():
         ENV_DST,
         len(TOPIC_ROUTES),
         sum(len(routes) for routes in FANOUT_ROUTES.values()),
+        sum(len(routes) for routes in WITHDRAWAL_PUBLIC_ROUTES.values()),
+        WITHDRAWAL_BACKFILL_ENABLED,
+        len(WITHDRAWAL_BACKFILL_PAIRS),
         str(DB_PATH),
         str(DEDUP_TTL_SECONDS),
         AUTO_RECOVERY,

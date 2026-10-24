@@ -1136,18 +1136,25 @@ async def call_with_retry(
             wait_s = float(getattr(e, "retry_after", 1.0))
             log.warning("[%s] RetryAfter %ss (intento %s/%s)", label, wait_s, i, tries)
             await asyncio.sleep(wait_s + 0.2)
+        # En python-telegram-bot, BadRequest y Forbidden heredan de
+        # NetworkError. Deben evaluarse antes para no reintentar errores
+        # definitivos. "Message is not modified" es una edición idempotente:
+        # el destino ya tiene exactamente el contenido solicitado.
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                log.info("[%s] EDICION SIN CAMBIOS | destino ya actualizado", label)
+                return None
+            log.error("[%s] BadRequest: %s", label, e)
+            raise
+        except Forbidden as e:
+            log.error("[%s] Forbidden: %s", label, e)
+            raise
         except (TimedOut, NetworkError) as e:
             last_exc = e
             metrics_inc("reintentos")
             wait = base_delay * (2 ** (i - 1))
             log.warning("[%s] Timeout/NetworkError (intento %s/%s). Esperando %.1fs. Err=%s", label, i, tries, wait, e)
             await asyncio.sleep(wait)
-        except BadRequest as e:
-            log.error("[%s] BadRequest: %s", label, e)
-            raise
-        except Forbidden as e:
-            log.error("[%s] Forbidden: %s", label, e)
-            raise
         except Exception as e:
             last_exc = e
             metrics_inc("reintentos")

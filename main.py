@@ -1,4 +1,5 @@
 import os
+from panel_buttons import has_panel_button, localize_panel_markup
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import html
@@ -840,6 +841,8 @@ def build_html_no_translate(text: str, entities: List[MessageEntity]) -> str:
 
 
 async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_translate: bool) -> Optional[InlineKeyboardMarkup]:
+    english_panel = bool(do_translate and TARGET_LANG.upper().startswith("EN"))
+    markup = localize_panel_markup(markup, english=english_panel)
     if not markup or not TRANSLATE_BUTTONS or not getattr(markup, "inline_keyboard", None):
         return markup
     if not do_translate:
@@ -863,7 +866,7 @@ async def translate_buttons(markup: Optional[InlineKeyboardMarkup], *, do_transl
                     )
                 )
             rows.append(new_row)
-        return InlineKeyboardMarkup(rows)
+        return localize_panel_markup(InlineKeyboardMarkup(rows), english=english_panel)
 
 
 # ================== MAPEO DE REPLY/EDITS (SQLite persistente) ==================
@@ -1790,6 +1793,8 @@ async def replicate_edit(
     if not dst_msg_id:
         return
 
+    panel_kb = (await translate_buttons(src_msg.reply_markup, do_translate=do_translate and TRANSLATE)) if has_panel_button(src_msg.reply_markup) else None
+
     if src_msg.text:
         name = sender_display_name(src_msg)
         pref = prefix_block(name)
@@ -1808,6 +1813,7 @@ async def replicate_edit(
                     text=html_text,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
+                    **({"reply_markup": panel_kb} if panel_kb is not None else {}),
                 ),
             )
         except BadRequest as e:
@@ -1830,6 +1836,7 @@ async def replicate_edit(
                 message_id=dst_msg_id,
                 caption=cap_html,
                 parse_mode=ParseMode.HTML,
+                **({"reply_markup": panel_kb} if panel_kb is not None else {}),
             ),
         )
 
@@ -2162,6 +2169,34 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         metrics_inc("fallidos")
         log.exception("Error on_channel_post")
         await alert_error(context, f"on_channel_post: {e}")
+
+
+async def on_channel_panel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Synchronize only panel buttons on an existing mapped channel copy."""
+    msg = update.edited_channel_post
+    if not msg or not has_panel_button(msg.reply_markup):
+        return
+    destination = map_channel(msg.chat)
+    if not destination:
+        return
+    try:
+        destination_id = destination if isinstance(destination, int) else int((await context.bot.get_chat(destination)).id)
+        copied_id = db_get_dst_msg(msg.chat.id, msg.message_id, destination_id)
+        if not copied_id:
+            log.warning("PANEL BUTTON EDIT: no stored copy for source message %s", msg.message_id)
+            return
+        keyboard = await translate_buttons(msg.reply_markup, do_translate=True)
+        await call_with_retry("panel_button_edit", lambda: context.bot.edit_message_reply_markup(
+            chat_id=destination_id, message_id=copied_id, reply_markup=keyboard))
+        log.info("PANEL BUTTON SYNC OK | source=%s | copy=%s", msg.message_id, copied_id)
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+        log.warning("PANEL BUTTON SYNC FAILED: %s", exc)
+        await alert_error(context, "No se pudo sincronizar el botón del panel: " + str(exc))
+    except Exception as exc:
+        log.warning("PANEL BUTTON SYNC FAILED: %s", exc)
+        await alert_error(context, "No se pudo sincronizar el botón del panel: " + str(exc))
 
 
 async def on_group_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2768,6 +2803,7 @@ def main():
     )
 
     # Opcional
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST & filters.ChatType.CHANNEL, on_channel_panel_edit))
     app.add_handler(CommandHandler("edit", cmd_edit), group=-1)
     app.add_handler(CommandHandler("editmedia", cmd_editmedia), group=-1)
 
@@ -2793,7 +2829,7 @@ def main():
     )
 
     app.run_polling(
-        allowed_updates=["channel_post", "message", "edited_message"],
+        allowed_updates=["channel_post", "message", "edited_message", "edited_channel_post"],
         poll_interval=1.2,
         bootstrap_retries=-1,
         stop_signals=None,

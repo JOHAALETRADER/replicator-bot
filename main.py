@@ -1,4 +1,5 @@
 import os
+from panel_repair_2566 import repair as repair_panel_post_2566
 from panel_buttons import has_panel_button, localize_panel_markup
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -2739,6 +2740,7 @@ async def post_init(application: Application) -> None:
         log.warning("BOT ARRANCO, pero la verificacion inicial fallo: %s", e)
 
     for coroutine in (
+        repair_panel_post_2566(application, DATA_DIR, log),
         health_monitor(application),
         metrics_monitor(),
         free_session_monitor(application),

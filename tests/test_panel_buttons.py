@@ -91,5 +91,5 @@ class Tests(unittest.IsolatedAsyncioTestCase):
   defs=lambda p:{n.name:ast.dump(n) for n in ast.parse(p.read_text()).body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef))}
   old,new=defs(before),defs(SOURCE)
   for name in old:
-   if name not in {'translate_buttons','replicate_edit','replicate_message','main'}:self.assertEqual(old[name],new[name],name)
+   if name not in {'translate_buttons','replicate_edit','replicate_message','main','post_init'}:self.assertEqual(old[name],new[name],name)
 if __name__=='__main__':unittest.main()

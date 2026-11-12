@@ -1643,6 +1643,13 @@ async def replicate_message(
     *,
     do_translate: bool,
 ):
+    if has_panel_button(src_msg.reply_markup) and isinstance(dest_chat_id, str):
+        try:
+            dest_chat_id = int((await context.bot.get_chat(dest_chat_id)).id)
+        except Exception as exc:
+            # Keep the original copy route working even if metadata lookup fails.
+            log.warning("PANEL BUTTON MAP: destination lookup unavailable: %s", exc)
+
     # Anti-loop interno: si ya es del bot, no repliques
     if is_from_bot(src_msg, context):
         return
